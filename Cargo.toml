@@ -1,0 +1,45 @@
+[package]
+name = "seahawk"
+version = "0.2.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.88"
+description = "Seahawk — the estate's authenticated broker for Unreal Engine's built-in MCP server (Epic's ModelContextProtocol plugin in UE 5.8): token-authenticated, class-curated, execute-class default-deny, append-only op log. Modern MCP era only (2026-07-28) on the agent side; bridges to Epic's legacy-era localhost server downstream. Lab-only."
+repository = "https://github.com/qompassai/seahawk"
+
+[lib]
+name = "seahawk"
+path = "src/lib.rs"
+
+[[bin]]
+name = "seahawk"
+path = "src/main.rs"
+
+[dependencies]
+# Fleet pin (D-113): one rmcp version across every estate server.
+# Born modern-only — no legacy era ever exists on the agent side.
+rmcp = { version = "=3.8.0", default-features = false, features = ["server", "client", "transport-child-process"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+toml = "0.9"
+anyhow = "1"
+# Downstream client to Epic's server: plain HTTP on loopback, blocking
+# client used only inside spawn_blocking tasks. No TLS features — the
+# downstream is loopback by contract and non-loopback URLs are refused.
+reqwest = { version = "0.12", default-features = false, features = ["blocking"] }
+# S4 host-GUI provider: pure-Rust X11 client (window enumeration,
+# EWMH focus, XTest input injection, GetImage screenshots). No shell
+# is ever invoked for GUI work — a subprocess would be an
+# execute-shaped side channel around decide().
+x11rb = { version = "0.13", default-features = false, features = ["xtest"] }
+# Screenshot encoding (RGB8 PNG) for observe results and op-log
+# frame digests.
+png = "0.17"
+# MCP image content blocks carry base64; used for observe
+# screenshots returned to agents.
+base64 = "0.22"
+
+[lints.clippy]
+all = "warn"

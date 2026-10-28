@@ -1,0 +1,78 @@
+# Seahawk configuration — copy to seahawk.toml and fill in.
+# Tokens are secrets: keep this file out of version control.
+
+[server]
+# Required. Agents present this per call in
+# _meta["seahawk/agent_token"].
+agent_token = "change-me-agent-token"
+# Optional but required for any execute-class call to be possible.
+# Distinct from the agent token; presented per execute call in
+# _meta["seahawk/operator_token"].
+operator_token = "change-me-operator-token"
+# When true, tools/list also requires the agent token.
+require_token_for_list = false
+
+[downstream]
+# Epic's editor MCP server. Loopback only — Seahawk refuses to
+# start with a non-loopback URL. Epic's defaults are port 8000 and
+# path /mcp; the S0 lab used 8123.
+url = "http://127.0.0.1:8000/mcp"
+timeout_secs = 120
+
+[policy]
+# Execute-class tools to enable (fully-qualified names as they
+# appear in tools/list). Empty = execute is impossible. Enabling a
+# tool here is necessary but not sufficient: each call must also
+# carry the operator token.
+execute_enabled = []
+# Actuate-class tools to enable (gui.<app>.actuate names from the
+# [gui] registrations below). Same two-key rule as execute: empty
+# = actuation is impossible, and each enabled call must also
+# carry the operator token.
+# Entries are full tool names, exactly as for execute_enabled
+# above — NOT application names. Enabling Blender actuation is:
+#   actuate_enabled = ["gui.blender.actuate"]
+# (An entry of "blender" matches nothing and the gate stays
+# shut: default-deny fails closed on a mis-authored policy.)
+actuate_enabled = []
+# Per-tool class overrides, e.g. classify a tool the census has
+# not covered, or tighten a class:
+# class_overrides = { "Some.Toolset.Tool" = "execute" }
+
+# GUI applications Seahawk may observe and (when enabled above)
+# drive on its own X11 display (S4). Registration exists ONLY
+# here, in operator-edited policy: there is no agent-callable
+# registration, and the file is read once at startup — edits take
+# effect at the next restart, never mid-run. A window belongs to
+# an app when a window_match string equals its WM_CLASS or
+# instance (case-insensitive) or appears in its title.
+[[gui.apps]]
+# Blender — the estate's 3D / rigging lane.
+name = "blender"
+display_name = "Blender"
+window_match = ["Blender"]
+
+[[gui.apps]]
+# Unity — Editor and Hub (media-gen / game lane). Matches the
+# editor's WM_CLASS, the Hub's class, and either title.
+name = "unity"
+display_name = "Unity"
+window_match = ["Unity", "unityhub", "Unity Hub"]
+
+[[gui.apps]]
+# ComfyUI — the neural authoring lane. Its GUI is browser-hosted;
+# the title match reaches the browser window showing a ComfyUI
+# session.
+name = "comfyui"
+display_name = "ComfyUI"
+window_match = ["ComfyUI"]
+
+[[gui.apps]]
+# Aseprite — the sprite / pixel-art lane.
+name = "aseprite"
+display_name = "Aseprite"
+window_match = ["Aseprite"]
+
+[oplog]
+# Append-only JSONL op log (created if absent).
+path = "seahawk-oplog.jsonl"
