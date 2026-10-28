@@ -1,16 +1,19 @@
-# conn
+# seahawk
 
 <a href="./LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License: Apache 2.0"></a>
 
 An authenticated rmcp broker fronting Unreal Engine 5.8's built-in MCP server.
 
-Nothing steers the editor except through the holder of the conn. AI agents
-talk to conn over MCP (modern era only, 2026-07-28); conn authenticates the
+Named for Rafael Sabatini's *The Sea Hawk* (1915) — the story of a man
+betrayed onto a slave galley who comes back as Sakr-el-Bahr, the Hawk of the
+Sea, and takes the ship. seahawk exists for the same reason a captain keeps
+the helm: nothing steers the editor except through it. AI agents talk to
+seahawk over MCP (modern era only, 2026-07-28); seahawk authenticates the
 connection, exposes a curated tool surface instead of everything the editor
 offers, and brokers calls to Unreal's own MCP server — which is never exposed
 raw to an agent. Unreal's raw server ships with no authentication model and
-includes executing Python inside the editor at full strength; conn exists so
-that surface can be used without being trusted.
+includes executing Python inside the editor at full strength; seahawk exists
+so that surface can be used without being trusted.
 
 ## Properties
 
