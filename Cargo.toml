@@ -1,6 +1,6 @@
 [package]
 name = "seahawk"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.88"
@@ -32,8 +32,9 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking"] 
 # S4 host-GUI provider: pure-Rust X11 client (window enumeration,
 # EWMH focus, XTest input injection, GetImage screenshots). No shell
 # is ever invoked for GUI work — a subprocess would be an
-# execute-shaped side channel around decide().
-x11rb = { version = "0.13", default-features = false, features = ["xtest"] }
+# execute-shaped side channel around decide(). S5 adds randr for
+# the display-geometry probe (virtual-vs-live detection).
+x11rb = { version = "0.13", default-features = false, features = ["xtest", "randr"] }
 # Screenshot encoding (RGB8 PNG) for observe results and op-log
 # frame digests.
 png = "0.17"

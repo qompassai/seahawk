@@ -23,12 +23,13 @@ use std::fmt;
 use std::sync::Arc;
 
 use rmcp::model::{Tool, ToolAnnotations};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::model::GuiApp;
 use crate::oplog::bytes_digest;
 use crate::policy::codes;
+use crate::vision::DisplayGeometry;
 
 // ---------------------------------------------------------------------------
 // Bounds (named, per Tiger Style: every external input is bounded
@@ -65,22 +66,22 @@ pub struct GuiError {
 }
 
 impl GuiError {
-    fn new(code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
         }
     }
 
-    fn bad_arguments(message: impl Into<String>) -> Self {
+    pub(crate) fn bad_arguments(message: impl Into<String>) -> Self {
         Self::new(codes::BAD_ARGUMENTS, message)
     }
 
-    fn unavailable(message: impl Into<String>) -> Self {
+    pub(crate) fn unavailable(message: impl Into<String>) -> Self {
         Self::new(codes::GUI_UNAVAILABLE, message)
     }
 
-    fn failed(message: impl Into<String>) -> Self {
+    pub(crate) fn failed(message: impl Into<String>) -> Self {
         Self::new(codes::GUI_ACTION_FAILED, message)
     }
 }
@@ -93,7 +94,7 @@ impl fmt::Display for GuiError {
 
 impl std::error::Error for GuiError {}
 
-type GuiResult<T> = Result<T, GuiError>;
+pub(crate) type GuiResult<T> = Result<T, GuiError>;
 
 // ---------------------------------------------------------------------------
 // Actions (parsed, validated argument vocabulary)
@@ -337,7 +338,7 @@ impl Frame {
 }
 
 /// One window on the display, as observed.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WindowInfo {
     /// X11 window id, decimal.
     pub id: u32,
@@ -381,11 +382,66 @@ pub struct ActuateOutcome {
 // Backend
 // ---------------------------------------------------------------------------
 
+/// One S5 capture: a screenshot plus the window rectangle and
+/// the display geometry in force when it was taken — the unit
+/// the vision layer stores and grounds against.
+#[derive(Clone, Debug)]
+pub struct Capture {
+    pub frame: Frame,
+    pub window: WindowInfo,
+    pub geometry: DisplayGeometry,
+}
+
 /// The GUI driver. One implementation ships (X11); tests use a
 /// fake. All methods block and are called from `spawn_blocking`.
 pub trait GuiBackend: Send + Sync {
     fn observe(&self, app: &GuiApp, kind: ObserveKind) -> GuiResult<ObserveOutcome>;
     fn actuate(&self, app: &GuiApp, action: &ActuateAction) -> GuiResult<ActuateOutcome>;
+
+    /// The geometry of the display this backend drives (S5).
+    /// Backends that cannot report it fail unavailable.
+    fn display_geometry(&self) -> GuiResult<DisplayGeometry> {
+        Err(GuiError::unavailable(
+            "this GUI backend cannot report display geometry",
+        ))
+    }
+
+    /// One capture (frame + target window + geometry). The
+    /// default composition reuses the S4 observe surface; the
+    /// window list and the screenshot resolve the same target
+    /// through the same matching rules.
+    fn capture(&self, app: &GuiApp) -> GuiResult<Capture> {
+        let listing = self.observe(app, ObserveKind::Windows)?;
+        let windows: Vec<WindowInfo> = listing
+            .payload
+            .get("windows")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| GuiError::failed(format!("window list payload is malformed: {e}")))?
+            .unwrap_or_default();
+        let matched: Vec<&WindowInfo> = windows.iter().filter(|w| w.matched).collect();
+        let Some(target) = pick_target(&matched) else {
+            return Err(GuiError::new(
+                codes::GUI_NO_WINDOW,
+                format!(
+                    "no window of {} ({}) is present on the display",
+                    app.display_name, app.name
+                ),
+            ));
+        };
+        let target = target.clone();
+        let shot = self.observe(app, ObserveKind::Screenshot)?;
+        let frame = shot
+            .frame
+            .ok_or_else(|| GuiError::failed("screenshot observe returned no frame"))?;
+        let geometry = self.display_geometry()?;
+        Ok(Capture {
+            frame,
+            window: target,
+            geometry,
+        })
+    }
 }
 
 /// The S4 provider facade: parses arguments, then drives the
@@ -414,6 +470,16 @@ impl Gui {
     pub fn actuate(&self, app: &GuiApp, args: &Value) -> GuiResult<ActuateOutcome> {
         let action = parse_actuate(args)?;
         self.backend.actuate(app, &action)
+    }
+
+    /// S5: one capture (frame + window + display geometry).
+    pub fn capture(&self, app: &GuiApp) -> GuiResult<Capture> {
+        self.backend.capture(app)
+    }
+
+    /// S5: the display geometry of the provider's display.
+    pub fn display_geometry(&self) -> GuiResult<DisplayGeometry> {
+        self.backend.display_geometry()
     }
 }
 
@@ -640,13 +706,16 @@ mod x11 {
     }
 
     impl X11Backend {
-        fn connect(&self) -> GuiResult<Session> {
-            let display = self
-                .display
+        /// The display name in force: the override, else `$DISPLAY`.
+        fn display_name(&self) -> Option<String> {
+            self.display
                 .clone()
                 .or_else(|| std::env::var("DISPLAY").ok())
-                .filter(|d| !d.is_empty());
-            let Some(display) = display else {
+                .filter(|d| !d.is_empty())
+        }
+
+        fn connect(&self) -> GuiResult<Session> {
+            let Some(display) = self.display_name() else {
                 return Err(GuiError::unavailable(
                     "no X11 display is configured (DISPLAY is unset): the GUI \
                      provider can only run where Seahawk itself has a display",
@@ -1171,6 +1240,8 @@ mod x11 {
                         "app": app.name,
                         "window": target.id,
                         "title": target.title,
+                        "x": target.x,
+                        "y": target.y,
                         "width": frame.width,
                         "height": frame.height,
                         "sha256": frame.digest(),
@@ -1182,6 +1253,65 @@ mod x11 {
                     })
                 }
             }
+        }
+
+        /// Display geometry from the X core protocol (root
+        /// dimensions + physical size) plus a RandR probe for the
+        /// virtual-display flag: Xvfb exposes exactly one output,
+        /// named "screen"; a live display names its connectors
+        /// (eDP-1, HDMI-A-1, ...). A failed RandR probe reports
+        /// `virtual_display = false` — the conservative reading.
+        fn display_geometry(&self) -> GuiResult<DisplayGeometry> {
+            use x11rb::protocol::randr::ConnectionExt as _;
+            let session = self.connect()?;
+            let setup = session.conn.setup();
+            let Some(screen) = setup.roots.iter().find(|s| s.root == session.root) else {
+                return Err(GuiError::failed("the root window is not in the X setup"));
+            };
+            let root_width = u32::from(screen.width_in_pixels);
+            let root_height = u32::from(screen.height_in_pixels);
+            let width_mm = u32::from(screen.width_in_millimeters);
+            let height_mm = u32::from(screen.height_in_millimeters);
+            let scale_factor = if width_mm > 0 {
+                let dpi = f64::from(root_width) * 25.4 / f64::from(width_mm);
+                (dpi / 96.0 * 1000.0).round() / 1000.0
+            } else {
+                1.0
+            };
+            let virtual_display = (|| -> Option<bool> {
+                let resources = session
+                    .conn
+                    .randr_get_screen_resources_current(session.root)
+                    .ok()?
+                    .reply()
+                    .ok()?;
+                if resources.outputs.is_empty() {
+                    return None;
+                }
+                let mut all_virtual = true;
+                for output in &resources.outputs {
+                    let info = session
+                        .conn
+                        .randr_get_output_info(*output, resources.config_timestamp)
+                        .ok()?
+                        .reply()
+                        .ok()?;
+                    if info.name != b"screen" {
+                        all_virtual = false;
+                    }
+                }
+                Some(all_virtual)
+            })()
+            .unwrap_or(false);
+            Ok(DisplayGeometry {
+                display: self.display_name(),
+                root_width,
+                root_height,
+                width_mm: (width_mm > 0).then_some(width_mm),
+                height_mm: (height_mm > 0).then_some(height_mm),
+                scale_factor,
+                virtual_display,
+            })
         }
 
         fn actuate(&self, app: &GuiApp, action: &ActuateAction) -> GuiResult<ActuateOutcome> {

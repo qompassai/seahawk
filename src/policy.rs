@@ -23,6 +23,23 @@ pub mod codes {
     pub const GUI_NO_WINDOW: &str = "seahawk_gui_no_window";
     pub const GUI_UNKNOWN_ACTION: &str = "seahawk_gui_unknown_action";
     pub const GUI_ACTION_FAILED: &str = "seahawk_gui_action_failed";
+    /// S5: the referenced screenshot is not in the broker's frame
+    /// store (unknown digest, or evicted).
+    pub const GUI_NO_FRAME: &str = "seahawk_gui_no_frame";
+    /// S5: the grounder ran and reported no confident location
+    /// (not found, or below the configured confidence floor).
+    pub const GUI_GROUND_FAILED: &str = "seahawk_gui_ground_failed";
+    /// S5: the requested grounding route is not available (no
+    /// local vision grounder configured, or it cannot be reached).
+    pub const GUI_GROUNDER_UNAVAILABLE: &str = "seahawk_gui_grounder_unavailable";
+    /// S5: an actuation happened but the post-action verification
+    /// did not observe the expected effect (bounded correction
+    /// exhausted). The action is NOT silently retried further.
+    pub const GUI_VERIFY_MISMATCH: &str = "seahawk_gui_verify_mismatch";
+    /// S5: the requested verification check cannot be evaluated
+    /// by the configured grounder route; the call is refused
+    /// before acting rather than acting unverified.
+    pub const GUI_VERIFY_UNAVAILABLE: &str = "seahawk_gui_verify_unavailable";
     pub const UNAUTHORIZED: &str = "seahawk_unauthorized";
     pub const DOWNSTREAM_UNAVAILABLE: &str = "seahawk_downstream_unavailable";
     pub const BAD_ARGUMENTS: &str = "seahawk_bad_arguments";

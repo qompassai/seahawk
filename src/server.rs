@@ -11,7 +11,7 @@
 //! `spawn_blocking`.
 
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use rmcp::handler::server::ServerHandler;
@@ -23,12 +23,17 @@ use rmcp::model::{
 use rmcp::{ErrorData as McpError, RoleServer};
 use serde_json::{Map, Value, json};
 
-use crate::config::Config;
+use crate::config::{Config, VisionRoute};
 use crate::downstream::Downstream;
-use crate::gui::{ActuateOutcome, Frame, Gui, ObserveOutcome};
+use crate::gui::WindowInfo;
+use crate::gui::{ActuateOutcome, Capture, Frame, Gui, GuiError, ObserveOutcome};
 use crate::model::{GuiApp, Surface, ToolClass, ToolRecord};
 use crate::oplog::{LogExtra, OpLog};
 use crate::policy::{self, Decision, ToolKnowledge, codes, token_matches};
+use crate::vision::{
+    self, CheckOutcome, Expectation, FrameStore, GroundHit, Grounder, OllamaGrounder, RawGrounding,
+    StoredFrame,
+};
 
 pub const META_OPERATOR_TOKEN: &str = "seahawk/operator_token";
 
@@ -36,12 +41,34 @@ const NATIVE_STATUS: &str = "seahawk_status";
 const NATIVE_SURFACE: &str = "seahawk_surface";
 const NATIVE_OPLOG: &str = "seahawk_oplog";
 
+/// S5 broker-level vision tools (the `gui.` namespace, but not
+/// per-app: the app is an argument, validated against the same
+/// policy registrations).
+const VISION_OBSERVE: &str = "gui.observe";
+const VISION_GROUND: &str = "gui.ground";
+const VISION_ACT_VERIFIED: &str = "gui.act_verified";
+
+/// S5 vision state: the bounded frame store frames are referenced
+/// by, and the configured local grounder (None unless policy
+/// selects the ollama route and the client built cleanly).
+struct VisionState {
+    frames: Mutex<FrameStore>,
+    grounder: Option<Arc<OllamaGrounder>>,
+}
+
+impl VisionState {
+    fn lock_frames(&self) -> std::sync::MutexGuard<'_, FrameStore> {
+        self.frames.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
 #[derive(Clone)]
 pub struct SeahawkServer {
     config: Arc<Config>,
     downstream: Arc<Downstream>,
     oplog: Arc<OpLog>,
     gui: Arc<Gui>,
+    vision: Arc<VisionState>,
     /// Lowercased GUI tool name → (registered app, is_actuate).
     /// Built once from policy at startup; registrations cannot
     /// change under a running server.
@@ -55,11 +82,29 @@ impl SeahawkServer {
             gui_targets.insert(app.observe_tool(), (app.clone(), false));
             gui_targets.insert(app.actuate_tool(), (app.clone(), true));
         }
+        let grounder = match config.vision.route {
+            VisionRoute::Ollama => match OllamaGrounder::new(
+                &config.vision.ollama_url,
+                &config.vision.ollama_model,
+                config.vision.timeout_secs,
+            ) {
+                Ok(grounder) => Some(Arc::new(grounder)),
+                Err(error) => {
+                    eprintln!("seahawk: local vision grounder unavailable: {error}");
+                    None
+                }
+            },
+            VisionRoute::Agent | VisionRoute::None => None,
+        };
         Self {
             config,
             downstream,
             oplog,
             gui: Arc::new(Gui::x11()),
+            vision: Arc::new(VisionState {
+                frames: Mutex::new(FrameStore::new()),
+                grounder,
+            }),
             gui_targets: Arc::new(gui_targets),
         }
     }
@@ -108,6 +153,162 @@ impl SeahawkServer {
                 Arc::new(oplog_schema),
             )
             .with_annotations(annotations),
+        ]
+    }
+
+    /// The three S5 vision tools. Contracts are written for a
+    /// caller that never reads this source (the D-207 loop is the
+    /// first consumer): each description states its inputs, its
+    /// outputs, and its refusal behaviour.
+    fn vision_tools() -> Vec<Tool> {
+        let read_annotations = ToolAnnotations::new()
+            .read_only(true)
+            .destructive(false)
+            .idempotent(true)
+            .open_world(false);
+        let mut observe_props = Map::new();
+        observe_props.insert(
+            "app".to_string(),
+            json!({"type": "string", "description": "Registered GUI application name (see seahawk_status gui_apps, e.g. \"blender\"). Unregistered names are refused with seahawk_unknown_tool."}),
+        );
+        let mut observe_schema = Map::new();
+        observe_schema.insert("type".to_string(), json!("object"));
+        observe_schema.insert("properties".to_string(), Value::Object(observe_props));
+        observe_schema.insert("required".to_string(), json!(["app"]));
+
+        let mut ground_props = Map::new();
+        ground_props.insert(
+            "frame_sha256".to_string(),
+            json!({"type": "string", "description": "Digest of a frame returned by gui.observe (or gui.act_verified). The broker grounds against exactly those pixels; unknown or evicted digests are refused with seahawk_gui_no_frame."}),
+        );
+        ground_props.insert(
+            "target".to_string(),
+            json!({"type": "string", "description": "Natural-language description of the UI element to locate, e.g. \"the Queue button\" or \"the render engine selector\"."}),
+        );
+        ground_props.insert(
+            "route".to_string(),
+            json!({"type": "string", "enum": ["local", "agent"], "description": "Grounding route. local: the broker's configured local vision model answers. agent: you answer — the first call returns status awaiting_agent_answer with the frame as an image; call again with the same frame_sha256 and target plus agent_answer. Default: the broker's configured route."}),
+        );
+        ground_props.insert(
+            "agent_answer".to_string(),
+            json!({"type": "object", "description": "Your grounding answer for the agent route: the element's center in WINDOW-RELATIVE pixels of the referenced frame, plus your confidence.", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "confidence": {"type": "number"}}, "required": ["x", "y", "confidence"]}),
+        );
+        let mut ground_schema = Map::new();
+        ground_schema.insert("type".to_string(), json!("object"));
+        ground_schema.insert("properties".to_string(), Value::Object(ground_props));
+        ground_schema.insert("required".to_string(), json!(["frame_sha256", "target"]));
+
+        let mut act_props = Map::new();
+        act_props.insert(
+            "app".to_string(),
+            json!({"type": "string", "description": "Registered GUI application name (see seahawk_status gui_apps). Unregistered names are refused with seahawk_unknown_tool."}),
+        );
+        act_props.insert(
+            "action".to_string(),
+            json!({"type": "string", "enum": ["focus", "click", "double_click", "key", "type", "scroll", "drag"], "description": "The input action — the same closed vocabulary as gui.<app>.actuate. There is no run/execute action."}),
+        );
+        act_props.insert(
+            "target".to_string(),
+            json!({"type": "string", "description": "Natural-language description of the element to act on. The broker grounds it on a fresh capture before each attempt. Mutually exclusive with raw x/y targeting (drag requires raw coordinates)."}),
+        );
+        act_props.insert(
+            "x".to_string(),
+            json!({"type": "integer", "description": "Raw targeting: window-relative x for click / double_click / scroll."}),
+        );
+        act_props.insert(
+            "y".to_string(),
+            json!({"type": "integer", "description": "Raw targeting: window-relative y for click / double_click / scroll."}),
+        );
+        act_props.insert(
+            "button".to_string(),
+            json!({"type": "integer", "enum": [1, 2, 3], "description": "Mouse button for click (default 1)."}),
+        );
+        act_props.insert(
+            "keys".to_string(),
+            json!({"type": "string", "description": "For key: a key spec like \"Return\", \"Escape\", \"ctrl+s\"."}),
+        );
+        act_props.insert(
+            "text".to_string(),
+            json!({"type": "string", "description": "For type: the text to enter (max 512 chars). Verify it with expect.text_visible or a title check where the UI allows readback."}),
+        );
+        act_props.insert(
+            "dx".to_string(),
+            json!({"type": "integer", "description": "For scroll: horizontal steps (default 0)."}),
+        );
+        act_props.insert(
+            "dy".to_string(),
+            json!({"type": "integer", "description": "For scroll: vertical steps (default 0; positive scrolls down)."}),
+        );
+        for field in ["from_x", "from_y", "to_x", "to_y"] {
+            act_props.insert(
+                field.to_string(),
+                json!({"type": "integer", "description": "For drag: window-relative endpoints (raw targeting only)."}),
+            );
+        }
+        act_props.insert(
+            "route".to_string(),
+            json!({"type": "string", "enum": ["local", "agent"], "description": "Grounding route when target is used. With route agent and no agent_answer, the call returns a grounding ticket (status awaiting_agent_answer, no action taken); re-call with agent_answer added."}),
+        );
+        act_props.insert(
+            "agent_answer".to_string(),
+            json!({"type": "object", "description": "Your grounding answer for the agent route: the element's center in window-relative pixels, plus confidence.", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "confidence": {"type": "number"}}, "required": ["x", "y", "confidence"]}),
+        );
+        act_props.insert(
+            "expect".to_string(),
+            json!({"type": "object", "description": "The expected effect, verified against a FRESH capture after acting. At least one machine check is required: changed (frame region around the point changed), title_contains (window title contains text), focused (app window holds focus), text_visible (text visibly present, needs the local grounder). description is free text for humans and the op log.", "properties": {"changed": {"type": "boolean"}, "title_contains": {"type": "string"}, "focused": {"type": "boolean"}, "text_visible": {"type": "string"}, "description": {"type": "string"}}}),
+        );
+        let mut act_schema = Map::new();
+        act_schema.insert("type".to_string(), json!("object"));
+        act_schema.insert("properties".to_string(), Value::Object(act_props));
+        act_schema.insert("required".to_string(), json!(["app", "action", "expect"]));
+
+        vec![
+            Tool::new(
+                VISION_OBSERVE,
+                "Observe a registered GUI application WITH display geometry (read-class): \
+                 screenshot of the app's window, its rectangle, and the display geometry \
+                 (root resolution, scale factor, virtual-vs-live flag). The frame is \
+                 stored by the broker and referenced by frame_sha256 in the result — \
+                 pass that digest to gui.ground so coordinates stay tied to the exact \
+                 pixels they were read from.",
+                Arc::new(observe_schema),
+            )
+            .with_annotations(read_annotations.clone()),
+            Tool::new(
+                VISION_GROUND,
+                "Ground a natural-language target to coordinates in a frame from \
+                 gui.observe (read-class). Returns window-relative x/y, \
+                 display-absolute coordinates, the grounder's confidence, and an \
+                 evidence crop image around the point. Routes: local (the broker's \
+                 configured vision model) or agent (you answer the broker's ticket \
+                 with agent_answer). Grounding is perception only — it grants no \
+                 permission to act; a point below the confidence floor is refused \
+                 with seahawk_gui_ground_failed rather than returned.",
+                Arc::new(ground_schema),
+            )
+            .with_annotations(read_annotations),
+            Tool::new(
+                VISION_ACT_VERIFIED,
+                "[actuate-class: default-deny — requires policy enablement of \
+                 gui.<app>.actuate and a per-call operator token] Act on a GUI target \
+                 and VERIFY the effect. Target by description (grounded on a fresh \
+                 capture per attempt) or by raw window-relative coordinates; the \
+                 action runs through the same decide() gate and window confinement \
+                 as gui.<app>.actuate. After acting, the broker captures a fresh \
+                 frame and evaluates the expect checks; on mismatch it re-grounds \
+                 and retries at most 2 times, then refuses with \
+                 seahawk_gui_verify_mismatch — note the action HAS been performed \
+                 in that case; both sides' screenshot hashes are in the op log and \
+                 the refusal's evidence.",
+                Arc::new(act_schema),
+            )
+            .with_annotations(
+                ToolAnnotations::new()
+                    .read_only(false)
+                    .destructive(true)
+                    .idempotent(false)
+                    .open_world(false),
+            ),
         ]
     }
 
@@ -186,6 +387,20 @@ impl SeahawkServer {
             "execute_enabled": self.config.execute_enabled.iter().collect::<Vec<_>>(),
             "actuate_enabled": self.config.actuate_enabled.iter().collect::<Vec<_>>(),
             "gui_apps": gui_apps,
+            "vision": {
+                "grounder": match self.config.vision.route {
+                    VisionRoute::Ollama => "ollama",
+                    VisionRoute::Agent => "agent",
+                    VisionRoute::None => "none",
+                },
+                "ollama_url": (self.config.vision.route == VisionRoute::Ollama)
+                    .then(|| self.config.vision.ollama_url.clone()),
+                "ollama_model": (self.config.vision.route == VisionRoute::Ollama)
+                    .then(|| self.config.vision.ollama_model.clone()),
+                "grounder_ready": self.vision.grounder.is_some(),
+                "min_confidence": self.config.vision.min_confidence,
+                "frames_stored": self.vision.lock_frames().len(),
+            },
             "class_overrides": self.config.class_overrides.len(),
             "oplog_path": self.oplog.path().display().to_string(),
             "oplog_write_failures": self.oplog.write_failures(),
@@ -543,6 +758,1080 @@ impl SeahawkServer {
     }
 }
 
+// ---------------------------------------------------------------------------
+// S5 vision handlers
+// ---------------------------------------------------------------------------
+
+/// Which grounding route a call uses: the broker's local vision
+/// model, or the calling agent answering through the ticket
+/// protocol.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum GroundRoute {
+    Local,
+    Agent,
+}
+
+impl GroundRoute {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Agent => "agent",
+        }
+    }
+}
+
+/// One completed act-verified attempt (actuation + verification),
+/// for the result payload and the mismatch evidence.
+struct AttemptRecord {
+    attempt: u32,
+    point: (i32, i32),
+    confidence: Option<f64>,
+    route: Option<&'static str>,
+    pre_sha256: String,
+    post_sha256: String,
+    checks: Vec<CheckOutcome>,
+}
+
+impl AttemptRecord {
+    fn to_json(&self) -> Value {
+        json!({
+            "attempt": self.attempt,
+            "point": {"x": self.point.0, "y": self.point.1},
+            "confidence": self.confidence,
+            "route": self.route,
+            "pre_sha256": self.pre_sha256,
+            "post_sha256": self.post_sha256,
+            "checks": self.checks,
+        })
+    }
+}
+
+/// How an act-verified run ended.
+enum ActVerifiedEnd {
+    Verified {
+        attempts: Vec<AttemptRecord>,
+        post_frame: Frame,
+        window: WindowInfo,
+    },
+    Mismatch {
+        attempts: Vec<AttemptRecord>,
+    },
+    Failed(GuiError),
+}
+
+fn window_json(window: &WindowInfo) -> Value {
+    json!({
+        "id": window.id,
+        "title": window.title,
+        "x": window.x,
+        "y": window.y,
+        "width": window.width,
+        "height": window.height,
+        "focused": window.focused,
+    })
+}
+
+/// A success result carrying a frame: image block + text summary,
+/// structured payload attached (the gui_call screenshot shape).
+fn image_result(payload: &Value, frame: &Frame, summary: String) -> CallToolResult {
+    use base64::Engine as _;
+    let mut result = CallToolResult::success(vec![
+        ContentBlock::image(
+            base64::engine::general_purpose::STANDARD.encode(&frame.png),
+            "image/png",
+        ),
+        ContentBlock::text(summary),
+    ]);
+    result.structured_content = Some(payload.clone());
+    result
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+impl SeahawkServer {
+    /// Logs a pre-action refusal (`refused:<code>`) and renders it.
+    fn refuse_logged(
+        &self,
+        tool: &str,
+        class: Option<&str>,
+        args: &Value,
+        error: &GuiError,
+    ) -> CallToolResult {
+        self.oplog.record(
+            tool,
+            class,
+            Some(args),
+            &format!("refused:{}", error.code),
+            None,
+            None,
+        );
+        typed_refusal(error.code, &error.message)
+    }
+
+    /// Logs a failure (`error`) and renders it as a typed refusal.
+    fn error_logged(
+        &self,
+        tool: &str,
+        class: Option<&str>,
+        args: &Value,
+        ms: Option<u64>,
+        error: &GuiError,
+    ) -> CallToolResult {
+        self.oplog
+            .record(tool, class, Some(args), "error", ms, Some(&error.message));
+        typed_refusal(error.code, &error.message)
+    }
+
+    /// Resolves the `app` argument of an S5 call against the
+    /// policy registrations. An unregistered app is refused with
+    /// the unknown-tool code — grounding grants no new surface.
+    fn gui_app_for(&self, tool: &str, args: &Value) -> Result<GuiApp, CallToolResult> {
+        let Some(name) = args.get("app").and_then(Value::as_str) else {
+            return Err(self.refuse_logged(
+                tool,
+                None,
+                args,
+                &GuiError::bad_arguments(
+                    "argument \"app\" is required (a registered GUI application name)",
+                ),
+            ));
+        };
+        match self
+            .config
+            .gui_apps
+            .iter()
+            .find(|app| app.name.eq_ignore_ascii_case(name))
+        {
+            Some(app) => Ok(app.clone()),
+            None => Err(self.refuse_logged(
+                tool,
+                None,
+                args,
+                &GuiError::new(
+                    codes::UNKNOWN_TOOL,
+                    format!(
+                        "app {name:?} is not a registered GUI application: registrations \
+                         are policy data ([[gui.apps]] in the config); the registered \
+                         names are listed by seahawk_status"
+                    ),
+                ),
+            )),
+        }
+    }
+
+    /// decide() for one S5 call, against a synthetic record named
+    /// exactly like the equivalent per-app tool — `gui.observe`
+    /// gates as `gui.<app>.observe` (read), `gui.act_verified` as
+    /// `gui.<app>.actuate` (actuate) — so S4's enablement policy
+    /// covers S5 verbatim and grounding grants no permission.
+    fn gate(
+        &self,
+        log_tool: &str,
+        app: &GuiApp,
+        actuate: bool,
+        args: &Value,
+        operator_token: &Option<String>,
+    ) -> Result<(), CallToolResult> {
+        let tool_name = if actuate {
+            app.actuate_tool()
+        } else {
+            app.observe_tool()
+        };
+        let (toolset, short_name) = crate::model::split_name(&tool_name);
+        let class = if actuate {
+            ToolClass::Actuate
+        } else {
+            ToolClass::Read
+        };
+        let record = ToolRecord {
+            name: tool_name,
+            toolset,
+            short_name,
+            description: String::new(),
+            input_schema: json!({"type": "object"}),
+            class,
+        };
+        let operator_ok = match (operator_token, &self.config.operator_token_digest) {
+            (Some(token), Some(digest)) => token_matches(token, digest),
+            _ => false,
+        };
+        match policy::decide(
+            &ToolKnowledge::Classified(&record),
+            &self.config,
+            operator_ok,
+        ) {
+            Decision::Allow => Ok(()),
+            Decision::Refuse { code, message } => {
+                self.oplog.record(
+                    log_tool,
+                    Some(class.as_str()),
+                    Some(args),
+                    &format!("refused:{code}"),
+                    None,
+                    None,
+                );
+                Err(typed_refusal(code, &message))
+            }
+        }
+    }
+
+    fn ground_route(&self, args: &Value) -> Result<GroundRoute, GuiError> {
+        match args.get("route").and_then(Value::as_str) {
+            None => match self.config.vision.route {
+                VisionRoute::Ollama => Ok(GroundRoute::Local),
+                VisionRoute::Agent => Ok(GroundRoute::Agent),
+                VisionRoute::None => Err(GuiError::new(
+                    codes::GUI_GROUNDER_UNAVAILABLE,
+                    "grounding is disabled by policy (vision.grounder = \"none\")",
+                )),
+            },
+            Some("local") => Ok(GroundRoute::Local),
+            Some("agent") => Ok(GroundRoute::Agent),
+            Some(other) => Err(GuiError::bad_arguments(format!(
+                "argument \"route\" must be \"local\" or \"agent\" (got {other:?})"
+            ))),
+        }
+    }
+
+    fn store_capture(&self, app: &GuiApp, capture: &Capture) -> String {
+        self.vision.lock_frames().put(
+            capture.frame.clone(),
+            app,
+            capture.window.clone(),
+            capture.geometry.clone(),
+        )
+    }
+
+    /// The local grounder's raw answer for a frame. Runs on a
+    /// blocking thread (HTTP to the loopback model server).
+    fn ground_locally_raw(&self, frame: &Frame, target: &str) -> Result<RawGrounding, GuiError> {
+        let Some(grounder) = &self.vision.grounder else {
+            return Err(GuiError::new(
+                codes::GUI_GROUNDER_UNAVAILABLE,
+                "no local vision grounder is available: policy must set \
+                 [vision] grounder = \"ollama\" with a served model, or the \
+                 caller uses route \"agent\"",
+            ));
+        };
+        grounder.ground(frame, target)
+    }
+
+    /// The agent-route ticket: a successful result carrying the
+    /// frame and the protocol for answering it. Nothing is
+    /// grounded and nothing is actuated by a ticket.
+    fn ground_ticket(&self, stored: &StoredFrame, target: &str, for_tool: &str) -> CallToolResult {
+        let payload = json!({
+            "status": "awaiting_agent_answer",
+            "frame_sha256": stored.frame.digest(),
+            "app": stored.app,
+            "target": target,
+            "width": stored.frame.width,
+            "height": stored.frame.height,
+            "window": window_json(&stored.window),
+            "display": stored.geometry.to_json(),
+            "how_to_answer": format!(
+                "Look at the attached frame and call {for_tool} again with the same \
+                 arguments plus agent_answer {{\"x\": <window-relative pixel x>, \
+                 \"y\": <window-relative pixel y>, \"confidence\": <0..1>}} — the \
+                 center of the target element in the frame's pixel coordinates."
+            ),
+        });
+        image_result(
+            &payload,
+            &stored.frame,
+            format!(
+                "grounding ticket for {target:?} in {} (frame {}): see image content",
+                stored.app,
+                stored.frame.digest()
+            ),
+        )
+    }
+
+    /// A completed grounding: evidence crop + structured hit,
+    /// op-logged with the ground evidence fields.
+    fn ground_hit_result(
+        &self,
+        args: &Value,
+        stored: &StoredFrame,
+        target: &str,
+        hit: GroundHit,
+        route_name: &str,
+        started: Instant,
+    ) -> CallToolResult {
+        let crop = match vision::evidence_crop(&stored.frame, hit.x, hit.y) {
+            Ok(crop) => crop,
+            Err(error) => {
+                return self.error_logged(VISION_GROUND, Some("read"), args, None, &error);
+            }
+        };
+        let crop_sha = crop.digest();
+        // The crop is itself a frame reference: stored under the
+        // same app/window/geometry so a caller can ground inside
+        // it or hand it to a reviewer as a first-class frame.
+        if let Some(app) = self
+            .config
+            .gui_apps
+            .iter()
+            .find(|app| app.name == stored.app)
+        {
+            self.vision.lock_frames().put(
+                crop.clone(),
+                app,
+                stored.window.clone(),
+                stored.geometry.clone(),
+            );
+        }
+        let payload = json!({
+            "status": "grounded",
+            "app": stored.app,
+            "frame_sha256": stored.frame.digest(),
+            "target": target,
+            "route": route_name,
+            "x": hit.x,
+            "y": hit.y,
+            "display_x": stored.window.x + hit.x,
+            "display_y": stored.window.y + hit.y,
+            "confidence": hit.confidence,
+            "window": window_json(&stored.window),
+            "display": stored.geometry.to_json(),
+            "evidence_crop_sha256": crop_sha,
+            "evidence_crop": {"width": crop.width, "height": crop.height},
+        });
+        self.oplog.record_with(
+            VISION_GROUND,
+            Some("read"),
+            Some(args),
+            "ok",
+            Some(elapsed_ms(started)),
+            None,
+            LogExtra {
+                frame_sha256: Some(stored.frame.digest()),
+                frame_width: Some(stored.frame.width),
+                frame_height: Some(stored.frame.height),
+                ground_x: Some(i64::from(hit.x)),
+                ground_y: Some(i64::from(hit.y)),
+                ground_confidence: Some(hit.confidence),
+                target: Some(target.to_string()),
+                ..Default::default()
+            },
+        );
+        image_result(
+            &payload,
+            &crop,
+            format!(
+                "grounded {target:?} in {} at window-relative {},{} (confidence {:.2}); \
+                 image content is the evidence crop around the point",
+                stored.app, hit.x, hit.y, hit.confidence
+            ),
+        )
+    }
+
+    /// `gui.observe`: capture + geometry, frame stored by digest.
+    async fn vision_observe(&self, args: Value) -> CallToolResult {
+        let started = Instant::now();
+        let app = match self.gui_app_for(VISION_OBSERVE, &args) {
+            Ok(app) => app,
+            Err(result) => return result,
+        };
+        if let Err(result) = self.gate(VISION_OBSERVE, &app, false, &args, &None) {
+            return result;
+        }
+        let gui = self.gui.clone();
+        let capture_app = app.clone();
+        let joined = tokio::task::spawn_blocking(move || gui.capture(&capture_app)).await;
+        match joined {
+            Ok(Ok(capture)) => {
+                let sha = self.store_capture(&app, &capture);
+                let payload = json!({
+                    "app": app.name,
+                    "frame_sha256": sha,
+                    "width": capture.frame.width,
+                    "height": capture.frame.height,
+                    "window": window_json(&capture.window),
+                    "display": capture.geometry.to_json(),
+                    "next": "pass frame_sha256 and a target description to gui.ground",
+                });
+                self.oplog.record_with(
+                    VISION_OBSERVE,
+                    Some("read"),
+                    Some(&args),
+                    "ok",
+                    Some(elapsed_ms(started)),
+                    None,
+                    LogExtra {
+                        frame_sha256: Some(sha.clone()),
+                        frame_width: Some(capture.frame.width),
+                        frame_height: Some(capture.frame.height),
+                        target: Some(format!(
+                            "window {} {:?}",
+                            capture.window.id, capture.window.title
+                        )),
+                        ..Default::default()
+                    },
+                );
+                image_result(
+                    &payload,
+                    &capture.frame,
+                    format!(
+                        "screenshot of {} window {:?} ({}x{}, sha256 {}): see image content",
+                        app.name,
+                        capture.window.title,
+                        capture.frame.width,
+                        capture.frame.height,
+                        sha
+                    ),
+                )
+            }
+            Ok(Err(error)) => self.error_logged(
+                VISION_OBSERVE,
+                Some("read"),
+                &args,
+                Some(elapsed_ms(started)),
+                &error,
+            ),
+            Err(join) => self.error_logged(
+                VISION_OBSERVE,
+                Some("read"),
+                &args,
+                Some(elapsed_ms(started)),
+                &GuiError::failed(format!("capture task failed: {join}")),
+            ),
+        }
+    }
+
+    /// `gui.ground`: description → coordinates in a stored frame.
+    async fn vision_ground(&self, args: Value) -> CallToolResult {
+        let started = Instant::now();
+        let Some(frame_sha) = args
+            .get("frame_sha256")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+        else {
+            return self.refuse_logged(
+                VISION_GROUND,
+                Some("read"),
+                &args,
+                &GuiError::bad_arguments(
+                    "argument \"frame_sha256\" is required (a digest returned by gui.observe)",
+                ),
+            );
+        };
+        let target = match parse_target_arg(&args, true) {
+            Ok(Some(target)) => target,
+            Ok(None) => unreachable!("required target parse yields a value or an error"),
+            Err(error) => return self.refuse_logged(VISION_GROUND, Some("read"), &args, &error),
+        };
+        let route = match self.ground_route(&args) {
+            Ok(route) => route,
+            Err(error) => return self.refuse_logged(VISION_GROUND, Some("read"), &args, &error),
+        };
+        let Some(stored) = self.vision.lock_frames().get(&frame_sha).cloned() else {
+            return self.refuse_logged(
+                VISION_GROUND,
+                Some("read"),
+                &args,
+                &GuiError::new(
+                    codes::GUI_NO_FRAME,
+                    format!(
+                        "frame {frame_sha} is not in the broker's frame store (unknown \
+                         digest, or evicted after {} stored captures): call gui.observe \
+                         to take a fresh frame",
+                        vision::MAX_STORED_FRAMES
+                    ),
+                ),
+            );
+        };
+        match route {
+            GroundRoute::Agent => match parse_agent_answer(&args) {
+                None => {
+                    self.oplog.record_with(
+                        VISION_GROUND,
+                        Some("read"),
+                        Some(&args),
+                        "ticket",
+                        Some(elapsed_ms(started)),
+                        None,
+                        LogExtra {
+                            frame_sha256: Some(stored.frame.digest()),
+                            frame_width: Some(stored.frame.width),
+                            frame_height: Some(stored.frame.height),
+                            target: Some(target.clone()),
+                            ..Default::default()
+                        },
+                    );
+                    self.ground_ticket(&stored, &target, VISION_GROUND)
+                }
+                Some(Err(error)) => self.refuse_logged(VISION_GROUND, Some("read"), &args, &error),
+                Some(Ok((x, y, confidence))) => {
+                    match vision::hit_from_agent_answer(&stored.frame, x, y, confidence) {
+                        Ok(hit) => {
+                            self.ground_hit_result(&args, &stored, &target, hit, "agent", started)
+                        }
+                        Err(error) => {
+                            self.refuse_logged(VISION_GROUND, Some("read"), &args, &error)
+                        }
+                    }
+                }
+            },
+            GroundRoute::Local => {
+                let Some(grounder) = self.vision.grounder.clone() else {
+                    return self.refuse_logged(
+                        VISION_GROUND,
+                        Some("read"),
+                        &args,
+                        &GuiError::new(
+                            codes::GUI_GROUNDER_UNAVAILABLE,
+                            "no local vision grounder is available: policy must set \
+                             [vision] grounder = \"ollama\" with a served model, or \
+                             the caller uses route \"agent\"",
+                        ),
+                    );
+                };
+                let frame = stored.frame.clone();
+                let ground_target = target.clone();
+                let joined =
+                    tokio::task::spawn_blocking(move || grounder.ground(&frame, &ground_target))
+                        .await;
+                match joined {
+                    Ok(Ok(raw)) => {
+                        let hit = vision::hit_from_raw(raw, &stored.frame);
+                        if hit.confidence < self.config.vision.min_confidence {
+                            let error = GuiError::new(
+                                codes::GUI_GROUND_FAILED,
+                                format!(
+                                    "grounder confidence {:.2} for {target:?} is below \
+                                     the configured floor {:.2}: refusing to return a \
+                                     point the grounder itself does not stand behind",
+                                    hit.confidence, self.config.vision.min_confidence
+                                ),
+                            );
+                            self.oplog.record_with(
+                                VISION_GROUND,
+                                Some("read"),
+                                Some(&args),
+                                "error",
+                                Some(elapsed_ms(started)),
+                                Some(&error.message),
+                                LogExtra {
+                                    frame_sha256: Some(stored.frame.digest()),
+                                    frame_width: Some(stored.frame.width),
+                                    frame_height: Some(stored.frame.height),
+                                    ground_x: Some(i64::from(hit.x)),
+                                    ground_y: Some(i64::from(hit.y)),
+                                    ground_confidence: Some(hit.confidence),
+                                    target: Some(target.clone()),
+                                    ..Default::default()
+                                },
+                            );
+                            return typed_refusal(error.code, &error.message);
+                        }
+                        self.ground_hit_result(&args, &stored, &target, hit, "ollama", started)
+                    }
+                    Ok(Err(error)) => self.error_logged(
+                        VISION_GROUND,
+                        Some("read"),
+                        &args,
+                        Some(elapsed_ms(started)),
+                        &error,
+                    ),
+                    Err(join) => self.error_logged(
+                        VISION_GROUND,
+                        Some("read"),
+                        &args,
+                        Some(elapsed_ms(started)),
+                        &GuiError::failed(format!("grounder task failed: {join}")),
+                    ),
+                }
+            }
+        }
+    }
+
+    /// `gui.act_verified`: decide() first, then the bounded
+    /// ground → act → verify loop (the loop itself is blocking
+    /// and runs in `act_verified_run` on a blocking thread).
+    async fn vision_act_verified(
+        &self,
+        args: Value,
+        operator_token: Option<String>,
+    ) -> CallToolResult {
+        let started = Instant::now();
+        let app = match self.gui_app_for(VISION_ACT_VERIFIED, &args) {
+            Ok(app) => app,
+            Err(result) => return result,
+        };
+        // The gate runs before any argument interpretation beyond
+        // the app name: an unenabled actuation is refused exactly
+        // as S4 refuses it, whatever else the call carries.
+        if let Err(result) = self.gate(VISION_ACT_VERIFIED, &app, true, &args, &operator_token) {
+            return result;
+        }
+        let expect = match Expectation::parse(&args) {
+            Ok(expect) => expect,
+            Err(error) => {
+                return self.refuse_logged(VISION_ACT_VERIFIED, Some("actuate"), &args, &error);
+            }
+        };
+        // A check the configured route cannot evaluate refuses
+        // the call BEFORE acting — never act unverified.
+        if expect.text_visible.is_some() && self.vision.grounder.is_none() {
+            return self.refuse_logged(
+                VISION_ACT_VERIFIED,
+                Some("actuate"),
+                &args,
+                &GuiError::new(
+                    codes::GUI_VERIFY_UNAVAILABLE,
+                    "expect.text_visible needs the local vision grounder to evaluate, \
+                     and none is configured (vision.grounder): refusing before \
+                     acting rather than acting unverified",
+                ),
+            );
+        }
+        let target = match parse_target_arg(&args, false) {
+            Ok(target) => target,
+            Err(error) => {
+                return self.refuse_logged(VISION_ACT_VERIFIED, Some("actuate"), &args, &error);
+            }
+        };
+        let route = match self.ground_route(&args) {
+            Ok(route) => route,
+            Err(error) => {
+                return self.refuse_logged(VISION_ACT_VERIFIED, Some("actuate"), &args, &error);
+            }
+        };
+        let agent_answer = match parse_agent_answer(&args) {
+            Some(Ok(answer)) => Some(answer),
+            Some(Err(error)) => {
+                return self.refuse_logged(VISION_ACT_VERIFIED, Some("actuate"), &args, &error);
+            }
+            None => None,
+        };
+        if let Some(target_text) = &target {
+            let action_name = args.get("action").and_then(Value::as_str).unwrap_or("");
+            if action_name == "drag" {
+                return self.refuse_logged(
+                    VISION_ACT_VERIFIED,
+                    Some("actuate"),
+                    &args,
+                    &GuiError::bad_arguments(
+                        "drag takes raw from_x/from_y/to_x/to_y coordinates; a single \
+                         grounded point cannot describe it",
+                    ),
+                );
+            }
+            // Agent-route grounding is a conversation, not a
+            // mid-call blocking wait: hand back a ticket and let
+            // the caller re-call with its answer. No action taken.
+            if route == GroundRoute::Agent && agent_answer.is_none() {
+                let gui = self.gui.clone();
+                let capture_app = app.clone();
+                let joined = tokio::task::spawn_blocking(move || gui.capture(&capture_app)).await;
+                return match joined {
+                    Ok(Ok(capture)) => {
+                        self.store_capture(&app, &capture);
+                        let stored = StoredFrame {
+                            frame: capture.frame,
+                            app: app.name.clone(),
+                            window: capture.window,
+                            geometry: capture.geometry,
+                        };
+                        self.oplog.record_with(
+                            VISION_ACT_VERIFIED,
+                            Some("actuate"),
+                            Some(&args),
+                            "ticket",
+                            Some(elapsed_ms(started)),
+                            None,
+                            LogExtra {
+                                frame_sha256: Some(stored.frame.digest()),
+                                frame_width: Some(stored.frame.width),
+                                frame_height: Some(stored.frame.height),
+                                target: Some(target_text.clone()),
+                                ..Default::default()
+                            },
+                        );
+                        self.ground_ticket(&stored, target_text, VISION_ACT_VERIFIED)
+                    }
+                    Ok(Err(error)) => self.error_logged(
+                        VISION_ACT_VERIFIED,
+                        Some("actuate"),
+                        &args,
+                        Some(elapsed_ms(started)),
+                        &error,
+                    ),
+                    Err(join) => self.error_logged(
+                        VISION_ACT_VERIFIED,
+                        Some("actuate"),
+                        &args,
+                        Some(elapsed_ms(started)),
+                        &GuiError::failed(format!("capture task failed: {join}")),
+                    ),
+                };
+            }
+        }
+        let expect_description = expect.description.clone();
+        let this = self.clone();
+        let run_app = app.clone();
+        let run_args = args.clone();
+        let joined = tokio::task::spawn_blocking(move || {
+            this.act_verified_run(
+                &run_app,
+                &run_args,
+                &expect,
+                target.as_deref(),
+                route,
+                agent_answer,
+            )
+        })
+        .await;
+        match joined {
+            Ok(ActVerifiedEnd::Verified {
+                attempts,
+                post_frame,
+                window,
+            }) => {
+                let last = attempts.last();
+                let payload = json!({
+                    "status": "verified",
+                    "app": app.name,
+                    "action": args.get("action").and_then(Value::as_str),
+                    "attempts": attempts.len(),
+                    "point": last.map(|a| json!({"x": a.point.0, "y": a.point.1})),
+                    "confidence": last.and_then(|a| a.confidence),
+                    "route": last.and_then(|a| a.route),
+                    "checks": last.map(|a| a.checks.clone()).unwrap_or_default(),
+                    "history": attempts.iter().map(AttemptRecord::to_json).collect::<Vec<_>>(),
+                    "pre_sha256": attempts.first().map(|a| a.pre_sha256.clone()),
+                    "post_sha256": last.map(|a| a.post_sha256.clone()),
+                    "window": window_json(&window),
+                    "expect_description": expect_description,
+                });
+                image_result(
+                    &payload,
+                    &post_frame,
+                    format!(
+                        "verified: {} on {} produced the expected effect after {} \
+                         attempt(s); image content is the post-action frame",
+                        args.get("action")
+                            .and_then(Value::as_str)
+                            .unwrap_or("action"),
+                        app.name,
+                        attempts.len()
+                    ),
+                )
+            }
+            Ok(ActVerifiedEnd::Mismatch { attempts }) => {
+                let last_failed = attempts
+                    .last()
+                    .and_then(|a| a.checks.iter().find(|c| !c.passed))
+                    .map(|c| c.check)
+                    .unwrap_or("unknown");
+                let message = format!(
+                    "the action was performed {} time(s) on {} but the expected effect \
+                     was not observed (last failed check: {last_failed}); bounded \
+                     correction is exhausted after {} re-ground+retry cycle(s) and \
+                     the broker stops here rather than acting blind — both sides' \
+                     screenshot hashes are in the evidence and the op log",
+                    attempts.len(),
+                    app.name,
+                    vision::MAX_VERIFY_RETRIES
+                );
+                let evidence = json!({
+                    "attempts": attempts.iter().map(AttemptRecord::to_json).collect::<Vec<_>>(),
+                    "pre_sha256": attempts.first().map(|a| a.pre_sha256.clone()),
+                    "post_sha256": attempts.last().map(|a| a.post_sha256.clone()),
+                    "action_performed": !attempts.is_empty(),
+                });
+                let mut result = CallToolResult::error(vec![ContentBlock::text(format!(
+                    "{}: {message}",
+                    codes::GUI_VERIFY_MISMATCH
+                ))]);
+                result.structured_content = Some(json!({
+                    "error": {"code": codes::GUI_VERIFY_MISMATCH, "message": message},
+                    "evidence": evidence,
+                }));
+                result
+            }
+            Ok(ActVerifiedEnd::Failed(error)) => self.error_logged(
+                VISION_ACT_VERIFIED,
+                Some("actuate"),
+                &args,
+                Some(elapsed_ms(started)),
+                &error,
+            ),
+            Err(join) => self.error_logged(
+                VISION_ACT_VERIFIED,
+                Some("actuate"),
+                &args,
+                Some(elapsed_ms(started)),
+                &GuiError::failed(format!("act-verified task failed: {join}")),
+            ),
+        }
+    }
+
+    /// The act-verified loop, blocking. Every completed attempt
+    /// appends its own op-log entries (a `gui.ground` entry when
+    /// the attempt grounded, then the `gui.act_verified` entry
+    /// with bracket hashes, ground fields, and the verify
+    /// outcome). decide() has already run in the handler — this
+    /// loop is one authorized call, retries included.
+    fn act_verified_run(
+        &self,
+        app: &GuiApp,
+        args: &Value,
+        expect: &Expectation,
+        target: Option<&str>,
+        route: GroundRoute,
+        agent_answer: Option<(i64, i64, f64)>,
+    ) -> ActVerifiedEnd {
+        let grounder_ref: Option<&dyn Grounder> = self
+            .vision
+            .grounder
+            .as_deref()
+            .map(|grounder| grounder as &dyn Grounder);
+        let mut attempts: Vec<AttemptRecord> = Vec::new();
+        for attempt in 0..=vision::MAX_VERIFY_RETRIES {
+            let attempt_started = Instant::now();
+            // --- Targeting: ground on a fresh capture, or take
+            // the caller's raw point from the action's own fields.
+            let mut act_args = args.clone();
+            let (ground_point, confidence, route_label) = match target {
+                Some(target_text) => {
+                    let capture = match self.gui.capture(app) {
+                        Ok(capture) => capture,
+                        Err(error) => return ActVerifiedEnd::Failed(error),
+                    };
+                    let frame_sha = self.store_capture(app, &capture);
+                    let hit = match route {
+                        GroundRoute::Agent => {
+                            // The handler only reaches the loop
+                            // with an answer in hand for this route.
+                            let Some((ax, ay, ac)) = agent_answer else {
+                                return ActVerifiedEnd::Failed(GuiError::new(
+                                    codes::GUI_GROUNDER_UNAVAILABLE,
+                                    "agent-route grounding inside gui.act_verified \
+                                     requires agent_answer in the call",
+                                ));
+                            };
+                            match vision::hit_from_agent_answer(&capture.frame, ax, ay, ac) {
+                                Ok(hit) => hit,
+                                Err(error) => return ActVerifiedEnd::Failed(error),
+                            }
+                        }
+                        GroundRoute::Local => {
+                            let raw = match self.ground_locally_raw(&capture.frame, target_text) {
+                                Ok(raw) => raw,
+                                Err(error) => return ActVerifiedEnd::Failed(error),
+                            };
+                            let hit = vision::hit_from_raw(raw, &capture.frame);
+                            if hit.confidence < self.config.vision.min_confidence {
+                                self.oplog.record_with(
+                                    VISION_GROUND,
+                                    Some("read"),
+                                    Some(args),
+                                    "error",
+                                    None,
+                                    Some("grounder confidence below the configured floor"),
+                                    LogExtra {
+                                        frame_sha256: Some(frame_sha),
+                                        frame_width: Some(capture.frame.width),
+                                        frame_height: Some(capture.frame.height),
+                                        ground_x: Some(i64::from(hit.x)),
+                                        ground_y: Some(i64::from(hit.y)),
+                                        ground_confidence: Some(hit.confidence),
+                                        target: Some(target_text.to_string()),
+                                        ..Default::default()
+                                    },
+                                );
+                                return ActVerifiedEnd::Failed(GuiError::new(
+                                    codes::GUI_GROUND_FAILED,
+                                    format!(
+                                        "grounder confidence {:.2} for {target_text:?} \
+                                         is below the configured floor {:.2}",
+                                        hit.confidence, self.config.vision.min_confidence
+                                    ),
+                                ));
+                            }
+                            hit
+                        }
+                    };
+                    self.oplog.record_with(
+                        VISION_GROUND,
+                        Some("read"),
+                        Some(args),
+                        "ok",
+                        None,
+                        None,
+                        LogExtra {
+                            frame_sha256: Some(frame_sha),
+                            frame_width: Some(capture.frame.width),
+                            frame_height: Some(capture.frame.height),
+                            ground_x: Some(i64::from(hit.x)),
+                            ground_y: Some(i64::from(hit.y)),
+                            ground_confidence: Some(hit.confidence),
+                            target: Some(target_text.to_string()),
+                            ..Default::default()
+                        },
+                    );
+                    if let Some(object) = act_args.as_object_mut() {
+                        object.insert("x".to_string(), json!(hit.x));
+                        object.insert("y".to_string(), json!(hit.y));
+                    }
+                    (
+                        Some((hit.x, hit.y)),
+                        Some(hit.confidence),
+                        Some(route.label()),
+                    )
+                }
+                None => (None, None, None),
+            };
+            // --- Act (through the S4 surface: parse, confine,
+            // bracket — unchanged).
+            let action = match crate::gui::parse_actuate(&act_args) {
+                Ok(action) => action,
+                Err(error) => return ActVerifiedEnd::Failed(error),
+            };
+            let outcome = match self.gui.actuate(app, &act_args) {
+                Ok(outcome) => outcome,
+                Err(error) => return ActVerifiedEnd::Failed(error),
+            };
+            // --- Verify against a fresh capture.
+            let post_capture = match self.gui.capture(app) {
+                Ok(capture) => capture,
+                Err(error) => {
+                    return ActVerifiedEnd::Failed(GuiError::new(
+                        codes::GUI_ACTION_FAILED,
+                        format!(
+                            "the action was performed on {} but the post-action \
+                             capture failed, so the effect cannot be verified: {}",
+                            app.name, error.message
+                        ),
+                    ));
+                }
+            };
+            let post_sha = self.store_capture(app, &post_capture);
+            let diff_frame = outcome
+                .post
+                .clone()
+                .unwrap_or_else(|| post_capture.frame.clone());
+            let verify_point = ground_point
+                .or_else(|| action.points().first().copied())
+                .unwrap_or((
+                    i32::try_from(outcome.pre.width / 2).unwrap_or(0),
+                    i32::try_from(outcome.pre.height / 2).unwrap_or(0),
+                ));
+            let checks = vision::evaluate_checks(
+                expect,
+                &outcome.pre,
+                &diff_frame,
+                &post_capture.window,
+                verify_point,
+                grounder_ref,
+            );
+            let passed = checks.iter().all(|check| check.passed);
+            let first_failed = checks
+                .iter()
+                .find(|check| !check.passed)
+                .map(|check| check.check);
+            self.oplog.record_with(
+                VISION_ACT_VERIFIED,
+                Some("actuate"),
+                Some(args),
+                if passed { "ok" } else { "error" },
+                Some(elapsed_ms(attempt_started)),
+                if passed {
+                    None
+                } else {
+                    Some("expected effect not observed")
+                },
+                LogExtra {
+                    pre_sha256: Some(outcome.pre.digest()),
+                    post_sha256: Some(post_sha.clone()),
+                    ground_x: ground_point.map(|(x, _)| i64::from(x)),
+                    ground_y: ground_point.map(|(_, y)| i64::from(y)),
+                    ground_confidence: confidence,
+                    target: Some(outcome.target.clone()),
+                    verify: Some(if passed {
+                        "verified".to_string()
+                    } else {
+                        format!("mismatch:{}", first_failed.unwrap_or("unknown"))
+                    }),
+                    ..Default::default()
+                },
+            );
+            attempts.push(AttemptRecord {
+                attempt: attempt + 1,
+                point: verify_point,
+                confidence,
+                route: route_label,
+                pre_sha256: outcome.pre.digest(),
+                post_sha256: post_sha,
+                checks,
+            });
+            if passed {
+                return ActVerifiedEnd::Verified {
+                    attempts,
+                    post_frame: post_capture.frame,
+                    window: post_capture.window,
+                };
+            }
+        }
+        ActVerifiedEnd::Mismatch { attempts }
+    }
+}
+
+/// Parses the optional `target` argument (bounded like all
+/// external input).
+fn parse_target_arg(args: &Value, required: bool) -> Result<Option<String>, GuiError> {
+    match args.get("target") {
+        None if !required => Ok(None),
+        None => Err(GuiError::bad_arguments(
+            "argument \"target\" is required (a natural-language description of the \
+             UI element to locate)",
+        )),
+        Some(value) => {
+            let Some(text) = value.as_str() else {
+                return Err(GuiError::bad_arguments(
+                    "argument \"target\" must be a string",
+                ));
+            };
+            if text.is_empty() || text.chars().count() > vision::MAX_TARGET_CHARS {
+                return Err(GuiError::bad_arguments(format!(
+                    "argument \"target\" must be 1..={} characters",
+                    vision::MAX_TARGET_CHARS
+                )));
+            }
+            Ok(Some(text.to_string()))
+        }
+    }
+}
+
+/// Parses the optional `agent_answer` argument: absent → None;
+/// present but malformed → an argument error (never silently
+/// ignored — a caller who thinks it answered must learn it did
+/// not).
+fn parse_agent_answer(args: &Value) -> Option<Result<(i64, i64, f64), GuiError>> {
+    let answer = args.get("agent_answer")?;
+    let parsed = (|| {
+        let x = answer
+            .get("x")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| GuiError::bad_arguments("agent_answer.x must be an integer"))?;
+        let y = answer
+            .get("y")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| GuiError::bad_arguments("agent_answer.y must be an integer"))?;
+        let confidence = answer
+            .get("confidence")
+            .and_then(Value::as_f64)
+            .ok_or_else(|| GuiError::bad_arguments("agent_answer.confidence must be a number"))?;
+        Ok((x, y, confidence))
+    })();
+    Some(parsed)
+}
+
 enum GuiOutcome {
     Observed(ObserveOutcome),
     Actuated(ActuateOutcome),
@@ -608,7 +1897,14 @@ impl ServerHandler for SeahawkServer {
              require policy enablement and a per-call operator token in \
              _meta[\"seahawk/operator_token\"]. Registered GUI applications appear \
              as gui.<app>.observe (read) and gui.<app>.actuate (actuate-class: the \
-             same default-deny two-key rule, enabled via policy.actuate_enabled)."
+             same default-deny two-key rule, enabled via policy.actuate_enabled). \
+             Vision grounding (S5): gui.observe captures a registered app's window \
+             WITH display geometry and stores the frame under its sha256; \
+             gui.ground turns a target description into coordinates in that frame \
+             (the broker's local vision model, or answer the broker's ticket \
+             yourself with agent_answer); gui.act_verified actuates through the \
+             same actuate gate and verifies the expected effect against a fresh \
+             capture, re-grounding and retrying at most twice before refusing."
                 .to_string(),
         );
         info
@@ -628,6 +1924,9 @@ impl ServerHandler for SeahawkServer {
         // downstream: they are listed whether or not an editor is
         // running.
         tools.extend(self.config.gui_apps.iter().flat_map(crate::gui::gui_tools));
+        // S5 vision tools are broker-level (the app is an
+        // argument), likewise independent of the downstream.
+        tools.extend(Self::vision_tools());
         if let Some(surface) = self.surface_snapshot().await {
             tools.extend(surface.tools.iter().map(Self::brokered_tool));
         }
@@ -672,6 +1971,27 @@ impl ServerHandler for SeahawkServer {
                 .gui_call(&app, actuate, arguments, operator_token)
                 .await;
             return Ok(result.into());
+        }
+        // S5 vision tools: broker-level names in the same `gui.`
+        // namespace, matched before the unknown-name refusal
+        // below. The app is an argument, validated against the
+        // same registrations inside the handlers.
+        if name.eq_ignore_ascii_case(VISION_OBSERVE) {
+            return Ok(self.vision_observe(arguments).await.into());
+        }
+        if name.eq_ignore_ascii_case(VISION_GROUND) {
+            return Ok(self.vision_ground(arguments).await.into());
+        }
+        if name.eq_ignore_ascii_case(VISION_ACT_VERIFIED) {
+            let operator_token = context
+                .meta
+                .get(META_OPERATOR_TOKEN)
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            return Ok(self
+                .vision_act_verified(arguments, operator_token)
+                .await
+                .into());
         }
         // The `gui.` prefix is Seahawk's own namespace: a name in
         // it that policy did not register is unknown, full stop —

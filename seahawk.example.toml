@@ -73,6 +73,28 @@ name = "aseprite"
 display_name = "Aseprite"
 window_match = ["Aseprite"]
 
+# Vision grounding (S5): how gui.ground resolves a natural-
+# language target to coordinates, and how gui.act_verified's
+# text-presence check is evaluated. Grounding is perception
+# only — it never widens what decide() allows.
+[vision]
+# ollama: a local vision model served by Ollama on loopback
+# (the broker is model-agnostic; the name is yours to pick —
+# the estate's candidate is benchmarked in GATE-REPORT-S5).
+# agent: the calling agent answers grounding tickets itself.
+# none: grounding is refused; gui.act_verified still accepts
+# raw coordinates with frame/title/focus checks.
+grounder = "agent"
+# Loopback only (enforced at load), ollama route only.
+ollama_url = "http://127.0.0.1:11434"
+# Required when grounder = "ollama".
+# ollama_model = "hf-glimmer-30b-vision:latest"
+# Grounding hits below this confidence are refused
+# (seahawk_gui_ground_failed), never acted on.
+min_confidence = 0.5
+# Per-request grounder timeout, seconds (1..=600).
+timeout_secs = 120
+
 [oplog]
 # Append-only JSONL op log (created if absent).
 path = "seahawk-oplog.jsonl"

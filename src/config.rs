@@ -22,6 +22,12 @@
 //! display_name = "Blender"
 //! window_match = ["Blender"]
 //!
+//! [vision]
+//! grounder = "ollama"          # ollama | agent | none
+//! ollama_url = "http://127.0.0.1:11434"   # loopback only
+//! ollama_model = "hf-glimmer-30b-vision:latest"
+//! min_confidence = 0.5
+//!
 //! [oplog]
 //! path = "seahawk-oplog.jsonl"
 //! ```
@@ -60,8 +66,74 @@ struct RawConfig {
     #[serde(default)]
     gui: RawGui,
     #[serde(default)]
+    vision: RawVision,
+    #[serde(default)]
     oplog: RawOplog,
 }
+
+/// The S5 vision-grounder route (policy data, read once at
+/// startup like everything else). `agent` is the protocol route:
+/// the calling agent answers grounding requests itself, so it
+/// needs no configuration and is available unless the operator
+/// sets `grounder = "none"`. `ollama` is a local vision model
+/// served over loopback HTTP — the broker is model-agnostic; the
+/// model choice is the operator's, benchmarked in GATE-REPORT-S5.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VisionRoute {
+    /// Local model via Ollama's loopback HTTP API.
+    Ollama,
+    /// The calling agent supplies coordinates through the
+    /// `gui.ground` ticket protocol.
+    Agent,
+    /// Grounding is disabled: `gui.ground` refuses, and
+    /// `gui.act_verified` accepts raw coordinates only.
+    None,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawVision {
+    #[serde(default)]
+    grounder: Option<String>,
+    #[serde(default)]
+    ollama_url: Option<String>,
+    #[serde(default)]
+    ollama_model: Option<String>,
+    #[serde(default)]
+    min_confidence: Option<f64>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+/// Validated S5 vision configuration.
+#[derive(Clone, Debug)]
+pub struct VisionConfig {
+    pub route: VisionRoute,
+    /// Loopback Ollama base URL (route Ollama only).
+    pub ollama_url: String,
+    /// Model name served by Ollama (route Ollama only).
+    pub ollama_model: String,
+    /// Grounding hits below this confidence are refused
+    /// (`seahawk_gui_ground_failed`) rather than acted on.
+    pub min_confidence: f64,
+    /// Per-request grounder timeout, seconds.
+    pub timeout_secs: u64,
+}
+
+impl Default for VisionConfig {
+    fn default() -> Self {
+        Self {
+            route: VisionRoute::Agent,
+            ollama_url: "http://127.0.0.1:11434".to_string(),
+            ollama_model: String::new(),
+            min_confidence: DEFAULT_MIN_CONFIDENCE,
+            timeout_secs: DEFAULT_VISION_TIMEOUT_SECS,
+        }
+    }
+}
+
+pub const DEFAULT_MIN_CONFIDENCE: f64 = 0.5;
+pub const DEFAULT_VISION_TIMEOUT_SECS: u64 = 120;
+pub const MAX_VISION_TIMEOUT_SECS: u64 = 600;
 
 #[derive(Debug, Default, Deserialize)]
 struct RawGui {
@@ -163,6 +235,8 @@ pub struct Config {
     /// GUI applications registered for the S4 host-GUI provider,
     /// in policy order.
     pub gui_apps: Vec<GuiApp>,
+    /// S5 vision-grounder configuration.
+    pub vision: VisionConfig,
     pub oplog_path: PathBuf,
 }
 
@@ -230,6 +304,7 @@ impl Config {
             class_overrides.insert(name.to_lowercase(), class);
         }
         let gui_apps = parse_gui_apps(&raw.gui)?;
+        let vision = parse_vision(&raw.vision)?;
         Ok(Self {
             agent_token_digest: digest(&raw.server.agent_token),
             operator_token_digest: raw.server.operator_token.as_deref().map(digest),
@@ -250,6 +325,7 @@ impl Config {
                 .collect(),
             class_overrides,
             gui_apps,
+            vision,
             oplog_path: raw.oplog.path,
         })
     }
@@ -342,6 +418,59 @@ fn parse_gui_apps(raw: &RawGui) -> anyhow::Result<Vec<GuiApp>> {
         });
     }
     Ok(apps)
+}
+
+/// Validates the `[vision]` section. The Ollama endpoint is held
+/// to the same loopback rule as the downstream: the broker speaks
+/// HTTP only to loopback services, so a grounder URL pointing off
+/// the machine is refused at load, not discovered at call time.
+fn parse_vision(raw: &RawVision) -> anyhow::Result<VisionConfig> {
+    let route = match raw.grounder.as_deref() {
+        None | Some("agent") => VisionRoute::Agent,
+        Some("ollama") => VisionRoute::Ollama,
+        Some("none") => VisionRoute::None,
+        Some(other) => {
+            bail!("config: vision.grounder = {other:?} is not one of ollama | agent | none")
+        }
+    };
+    let mut vision = VisionConfig {
+        route,
+        ..VisionConfig::default()
+    };
+    if let Some(url) = &raw.ollama_url {
+        if !is_loopback_url(url) {
+            bail!(
+                "config: vision.ollama_url must be a loopback http(s) URL (got {url}); \
+                 the vision grounder is a local service by contract"
+            );
+        }
+        vision.ollama_url = url.clone();
+    }
+    if let Some(model) = &raw.ollama_model {
+        if model.is_empty() || model.chars().count() > 128 {
+            bail!("config: vision.ollama_model must be 1..=128 characters");
+        }
+        vision.ollama_model = model.clone();
+    }
+    if route == VisionRoute::Ollama && vision.ollama_model.is_empty() {
+        bail!(
+            "config: vision.grounder = \"ollama\" requires vision.ollama_model \
+             (the broker is model-agnostic; the operator names the model)"
+        );
+    }
+    if let Some(min) = raw.min_confidence {
+        if !(0.0..=1.0).contains(&min) {
+            bail!("config: vision.min_confidence must be within 0.0..=1.0");
+        }
+        vision.min_confidence = min;
+    }
+    if let Some(timeout) = raw.timeout_secs {
+        if timeout == 0 || timeout > MAX_VISION_TIMEOUT_SECS {
+            bail!("config: vision.timeout_secs must be within 1..={MAX_VISION_TIMEOUT_SECS}");
+        }
+        vision.timeout_secs = timeout;
+    }
+    Ok(vision)
 }
 
 #[cfg(test)]
@@ -451,5 +580,34 @@ mod tests {
         let cfg = Config::parse(text).expect("config");
         assert!(cfg.execute_is_enabled("some.toolset.runit"));
         assert_eq!(cfg.class_of("OTHER.TOOL"), Some(ToolClass::Execute));
+    }
+
+    #[test]
+    fn vision_defaults_to_the_agent_route() {
+        let cfg = Config::parse(MINIMAL).expect("config");
+        assert_eq!(cfg.vision.route, VisionRoute::Agent);
+        assert_eq!(cfg.vision.min_confidence, DEFAULT_MIN_CONFIDENCE);
+    }
+
+    #[test]
+    fn vision_ollama_route_requires_a_model_and_loopback() {
+        let ok = "[server]\nagent_token = \"x\"\n[vision]\ngrounder = \"ollama\"\n\
+                  ollama_model = \"some-vision-model\"\nmin_confidence = 0.7\n";
+        let cfg = Config::parse(ok).expect("config");
+        assert_eq!(cfg.vision.route, VisionRoute::Ollama);
+        assert_eq!(cfg.vision.ollama_model, "some-vision-model");
+        assert_eq!(cfg.vision.min_confidence, 0.7);
+        // No model named: refused at load.
+        let no_model = "[server]\nagent_token = \"x\"\n[vision]\ngrounder = \"ollama\"\n";
+        assert!(Config::parse(no_model).is_err());
+        // Off-loopback grounder endpoint: refused at load.
+        let remote = "[server]\nagent_token = \"x\"\n[vision]\ngrounder = \"ollama\"\n\
+                      ollama_model = \"m\"\nollama_url = \"http://192.168.1.10:11434\"\n";
+        assert!(Config::parse(remote).is_err());
+        // Unknown route and out-of-range confidence: refused.
+        let bad_route = "[server]\nagent_token = \"x\"\n[vision]\ngrounder = \"cloud\"\n";
+        assert!(Config::parse(bad_route).is_err());
+        let bad_conf = "[server]\nagent_token = \"x\"\n[vision]\nmin_confidence = 1.5\n";
+        assert!(Config::parse(bad_conf).is_err());
     }
 }

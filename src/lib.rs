@@ -17,6 +17,16 @@
 //! `gui.<app>.actuate` (actuate) tools, driven over X11 by Seahawk
 //! itself. Registration exists only as operator-edited policy data;
 //! there is no agent-callable registration path.
+//!
+//! S5 adds vision grounding (`vision` module): three broker-level
+//! tools — `gui.observe` (screenshot + display geometry, frames
+//! referenced by digest), `gui.ground` (natural-language target →
+//! coordinates via a pluggable grounder: a local Ollama-served
+//! vision model, or the calling agent answering a broker ticket),
+//! and `gui.act_verified` (actuate-class action through the same
+//! decide() lattice, verified against a fresh capture with bounded
+//! correction). Grounding is perception only; it grants no
+//! permission.
 
 pub mod config;
 pub mod downstream;
@@ -26,3 +36,4 @@ pub mod model;
 pub mod oplog;
 pub mod policy;
 pub mod server;
+pub mod vision;

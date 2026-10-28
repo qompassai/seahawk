@@ -62,6 +62,22 @@ pub struct OpEntry {
     /// e.g. `click 640,512 window 0x2a00007 "Blender"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    /// S5 grounding evidence: the window-relative point the
+    /// grounder returned for this entry's call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ground_x: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ground_y: Option<i64>,
+    /// S5 grounding evidence: the grounder's confidence for the
+    /// returned point (0.0..=1.0), recorded on success and on a
+    /// below-floor refusal alike — the record shows what the
+    /// grounder claimed, not only what passed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ground_confidence: Option<f64>,
+    /// S5 verification outcome for an act-verified call:
+    /// `verified` or `mismatch:<check>` (the first failed check).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verify: Option<String>,
 }
 
 /// The S4 evidence fields of an op-log entry. All optional; the
@@ -74,6 +90,12 @@ pub struct LogExtra {
     pub pre_sha256: Option<String>,
     pub post_sha256: Option<String>,
     pub target: Option<String>,
+    /// S5 evidence fields (grounding point/confidence, verify
+    /// outcome) — same extension pattern as the S4 fields.
+    pub ground_x: Option<i64>,
+    pub ground_y: Option<i64>,
+    pub ground_confidence: Option<f64>,
+    pub verify: Option<String>,
 }
 
 pub struct OpLog {
@@ -165,6 +187,10 @@ impl OpLog {
             pre_sha256: extra.pre_sha256,
             post_sha256: extra.post_sha256,
             target: extra.target,
+            ground_x: extra.ground_x,
+            ground_y: extra.ground_y,
+            ground_confidence: extra.ground_confidence,
+            verify: extra.verify,
         };
         let line = serde_json::to_string(&entry).unwrap_or_else(|_| "{}".to_string());
         let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
