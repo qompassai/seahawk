@@ -50,15 +50,141 @@ const VISION_ACT_VERIFIED: &str = "gui.act_verified";
 
 /// S5 vision state: the bounded frame store frames are referenced
 /// by, and the configured local grounder (None unless policy
-/// selects the ollama route and the client built cleanly).
+/// selects the ollama route).
 struct VisionState {
     frames: Mutex<FrameStore>,
-    grounder: Option<Arc<OllamaGrounder>>,
+    grounder: Option<Arc<GrounderClient>>,
 }
 
 impl VisionState {
     fn lock_frames(&self) -> std::sync::MutexGuard<'_, FrameStore> {
         self.frames.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn has_local_grounder(&self) -> bool {
+        self.grounder.is_some()
+    }
+
+    fn grounder_ready(&self) -> bool {
+        self.grounder
+            .as_ref()
+            .is_some_and(|client| client.ready.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// One request to the grounder worker thread.
+enum GrounderCommand {
+    Ground {
+        frame: Frame,
+        target: String,
+        reply: std::sync::mpsc::Sender<Result<RawGrounding, GuiError>>,
+    },
+    Present {
+        frame: Frame,
+        text: String,
+        reply: std::sync::mpsc::Sender<Result<bool, GuiError>>,
+    },
+}
+
+/// The handle handlers use to reach the local grounder. The
+/// blocking HTTP client lives on a dedicated worker thread —
+/// the downstream client's pattern (downstream.rs): a
+/// reqwest::blocking client must never be built, used, or
+/// dropped inside the tokio runtime (its internal runtime
+/// panics on drop in an async context), so the broker sends
+/// grounding requests over a channel and the worker answers.
+/// Calls block the calling (blocking-pool) thread until the
+/// worker replies; the HTTP timeout bounds the wait.
+struct GrounderClient {
+    commands: std::sync::mpsc::Sender<GrounderCommand>,
+    ready: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl GrounderClient {
+    fn call<T>(
+        &self,
+        command: impl FnOnce(std::sync::mpsc::Sender<Result<T, GuiError>>) -> GrounderCommand,
+    ) -> Result<T, GuiError> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.commands.send(command(reply_tx)).map_err(|_| {
+            GuiError::new(
+                codes::GUI_GROUNDER_UNAVAILABLE,
+                "the local vision grounder worker is not running (its client \
+                 failed to build or the worker exited)",
+            )
+        })?;
+        reply_rx.recv().map_err(|_| {
+            GuiError::new(
+                codes::GUI_GROUNDER_UNAVAILABLE,
+                "the local vision grounder worker exited without answering",
+            )
+        })?
+    }
+}
+
+impl Grounder for GrounderClient {
+    fn route_name(&self) -> &'static str {
+        "ollama"
+    }
+
+    fn ground(&self, frame: &Frame, target: &str) -> Result<RawGrounding, GuiError> {
+        let frame = frame.clone();
+        let target = target.to_string();
+        self.call(|reply| GrounderCommand::Ground {
+            frame,
+            target,
+            reply,
+        })
+    }
+
+    fn text_present(&self, frame: &Frame, text: &str) -> Result<bool, GuiError> {
+        let frame = frame.clone();
+        let text = text.to_string();
+        self.call(|reply| GrounderCommand::Present { frame, text, reply })
+    }
+}
+
+/// Spawns the grounder worker thread for the ollama route. The
+/// thread owns the OllamaGrounder for its whole life; a client
+/// build failure is reported on stderr, leaves `ready` false,
+/// and makes every call answer grounder-unavailable.
+fn spawn_grounder_worker(url: &str, model: &str, timeout_secs: u64) -> GrounderClient {
+    let (tx, rx) = std::sync::mpsc::channel::<GrounderCommand>();
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker_ready = ready.clone();
+    let (url, model) = (url.to_string(), model.to_string());
+    let spawned = std::thread::Builder::new()
+        .name("seahawk-grounder".to_string())
+        .spawn(move || {
+            let grounder = match OllamaGrounder::new(&url, &model, timeout_secs) {
+                Ok(grounder) => grounder,
+                Err(error) => {
+                    eprintln!("seahawk: local vision grounder unavailable: {error}");
+                    return;
+                }
+            };
+            worker_ready.store(true, std::sync::atomic::Ordering::Relaxed);
+            while let Ok(command) = rx.recv() {
+                match command {
+                    GrounderCommand::Ground {
+                        frame,
+                        target,
+                        reply,
+                    } => {
+                        let _ = reply.send(grounder.ground(&frame, &target));
+                    }
+                    GrounderCommand::Present { frame, text, reply } => {
+                        let _ = reply.send(grounder.text_present(&frame, &text));
+                    }
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        eprintln!("seahawk: cannot spawn the grounder worker thread: {error}");
+    }
+    GrounderClient {
+        commands: tx,
+        ready,
     }
 }
 
@@ -83,17 +209,11 @@ impl SeahawkServer {
             gui_targets.insert(app.actuate_tool(), (app.clone(), true));
         }
         let grounder = match config.vision.route {
-            VisionRoute::Ollama => match OllamaGrounder::new(
+            VisionRoute::Ollama => Some(Arc::new(spawn_grounder_worker(
                 &config.vision.ollama_url,
                 &config.vision.ollama_model,
                 config.vision.timeout_secs,
-            ) {
-                Ok(grounder) => Some(Arc::new(grounder)),
-                Err(error) => {
-                    eprintln!("seahawk: local vision grounder unavailable: {error}");
-                    None
-                }
-            },
+            ))),
             VisionRoute::Agent | VisionRoute::None => None,
         };
         Self {
@@ -397,7 +517,7 @@ impl SeahawkServer {
                     .then(|| self.config.vision.ollama_url.clone()),
                 "ollama_model": (self.config.vision.route == VisionRoute::Ollama)
                     .then(|| self.config.vision.ollama_model.clone()),
-                "grounder_ready": self.vision.grounder.is_some(),
+                "grounder_ready": self.vision.grounder_ready(),
                 "min_confidence": self.config.vision.min_confidence,
                 "frames_stored": self.vision.lock_frames().len(),
             },
@@ -1376,7 +1496,7 @@ impl SeahawkServer {
         };
         // A check the configured route cannot evaluate refuses
         // the call BEFORE acting — never act unverified.
-        if expect.text_visible.is_some() && self.vision.grounder.is_none() {
+        if expect.text_visible.is_some() && !self.vision.has_local_grounder() {
             return self.refuse_logged(
                 VISION_ACT_VERIFIED,
                 Some("actuate"),

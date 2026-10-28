@@ -308,10 +308,6 @@ impl OllamaGrounder {
         })
     }
 
-    pub fn model(&self) -> &str {
-        &self.model
-    }
-
     /// One image chat round-trip; returns the model's text reply.
     fn chat_image(&self, prompt: &str, frame: &Frame) -> GuiResult<String> {
         let image = base64::engine::general_purpose::STANDARD.encode(&frame.png);

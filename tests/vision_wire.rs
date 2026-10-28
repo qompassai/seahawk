@@ -269,6 +269,44 @@ fn status_reports_the_vision_configuration() {
     assert_eq!(vision["frames_stored"], 0, "{vision}");
 }
 
+#[test]
+fn ollama_route_broker_starts_and_reports_its_route() {
+    // Regression (found live on primo, S5): the local grounder's
+    // blocking HTTP client must live on a dedicated worker
+    // thread — building it inside the tokio runtime panicked the
+    // broker at startup with this exact configuration, while
+    // agent-route configs (no client) started fine. The broker
+    // must start, list tools, and report the route even with the
+    // model server dead (port 9): construction must not depend
+    // on reachability.
+    let mut s = Session::spawn_vision(
+        false,
+        "[vision]\ngrounder = \"ollama\"\nollama_url = \"http://127.0.0.1:9\"\n\
+         ollama_model = \"no-such-model\"\n",
+    );
+    s.handshake();
+    let response = s.rpc("tools/list", json!({"_meta": meta()}));
+    let tools = response["result"]["tools"].as_array().expect("tools array");
+    assert!(
+        tools.iter().any(|t| t["name"] == "gui.ground"),
+        "broker with an ollama grounder must still list the vision tools"
+    );
+    // The worker builds its client asynchronously; poll briefly
+    // for readiness rather than racing the thread.
+    let mut vision = Value::Null;
+    for _ in 0..20 {
+        let response = s.call("seahawk_status", json!({}), None);
+        vision = response["result"]["structuredContent"]["vision"].clone();
+        if vision["grounder_ready"] == true {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(vision["grounder"], "ollama", "{vision}");
+    assert_eq!(vision["grounder_ready"], true, "{vision}");
+    assert_eq!(vision["ollama_model"], "no-such-model", "{vision}");
+}
+
 // ---------------------------------------------------------------------------
 // Observe: registration is the whole surface
 // ---------------------------------------------------------------------------
