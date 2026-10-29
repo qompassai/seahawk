@@ -95,6 +95,18 @@ min_confidence = 0.5
 # Per-request grounder timeout, seconds (1..=600).
 timeout_secs = 120
 
+# Acquisition lane (D-246/D-248): Seahawk acquires CLEARED-
+# determination works from allowlisted domains (initially
+# doujins.com) into a quarantine dir; neemu ingests from there
+# through its existing registration path. Disabled by default:
+# enabling the lane here is the operator's act. Unattended
+# acquisition and the seahawk_gui transport additionally refuse
+# until the S5 frozen benchmark re-passes (GATE-REPORT-S5).
+[acquisition]
+enabled = false
+# Primo at landing: under ~/.local/share/<project>/.
+quarantine_dir = "seahawk-quarantine"
+
 [oplog]
 # Append-only JSONL op log (created if absent).
 path = "seahawk-oplog.jsonl"

@@ -72,7 +72,38 @@ struct RawConfig {
     #[serde(default)]
     feedback: RawFeedback,
     #[serde(default)]
+    acquisition: RawAcquisition,
+    #[serde(default)]
     oplog: RawOplog,
+}
+
+/// The acquisition lane's operator policy (D-246). The lane is
+/// disabled unless the operator enables it here: enablement is
+/// the operator's act, recorded in this file like every other
+/// policy. `quarantine_dir` is where acquired media lands
+/// (primo at landing: under `~/.local/share/<project>/`).
+#[derive(Debug, Default, Deserialize)]
+struct RawAcquisition {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    quarantine_dir: Option<String>,
+}
+
+/// Validated acquisition-lane configuration.
+#[derive(Clone, Debug)]
+pub struct AcquisitionConfig {
+    pub enabled: bool,
+    pub quarantine_dir: PathBuf,
+}
+
+impl Default for AcquisitionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            quarantine_dir: PathBuf::from("seahawk-quarantine"),
+        }
+    }
 }
 
 /// The S5 vision-grounder route (policy data, read once at
@@ -336,6 +367,8 @@ pub struct Config {
     pub tooling: Vec<ToolingEntry>,
     /// D-230 wiring: `code.feedback` bounds + project roots.
     pub feedback: FeedbackConfig,
+    /// Acquisition-lane configuration (D-246).
+    pub acquisition: AcquisitionConfig,
     pub oplog_path: PathBuf,
 }
 
@@ -406,6 +439,16 @@ impl Config {
         let vision = parse_vision(&raw.vision)?;
         let tooling = parse_tooling(&raw.tooling)?;
         let feedback = parse_feedback(&raw.feedback)?;
+        let acquisition = AcquisitionConfig {
+            enabled: raw.acquisition.enabled,
+            quarantine_dir: raw
+                .acquisition
+                .quarantine_dir
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("seahawk-quarantine")),
+        };
         Ok(Self {
             agent_token_digest: digest(&raw.server.agent_token),
             operator_token_digest: raw.server.operator_token.as_deref().map(digest),
@@ -429,6 +472,7 @@ impl Config {
             vision,
             tooling,
             feedback,
+            acquisition,
             oplog_path: raw.oplog.path,
         })
     }

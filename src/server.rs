@@ -23,6 +23,7 @@ use rmcp::model::{
 use rmcp::{ErrorData as McpError, RoleServer};
 use serde_json::{Map, Value, json};
 
+use crate::acquisition::{self, Mode, Transport, WorkRecord};
 use crate::config::{Config, ToolingId, VisionRoute};
 use crate::downstream::Downstream;
 use crate::gui::WindowInfo;
@@ -41,6 +42,9 @@ pub const META_OPERATOR_TOKEN: &str = "seahawk/operator_token";
 const NATIVE_STATUS: &str = "seahawk_status";
 const NATIVE_SURFACE: &str = "seahawk_surface";
 const NATIVE_OPLOG: &str = "seahawk_oplog";
+/// Acquisition lane verb (D-246/D-248): one tool, action-selected,
+/// so the lane fits the D-247 native token cap.
+const ACQUIRE_TOOL: &str = "seahawk_acquire";
 
 /// S5 broker-level vision tools (the `gui.` namespace, but not
 /// per-app: the app is an argument, validated against the same
@@ -307,6 +311,18 @@ impl SeahawkServer {
                 Arc::new(oplog_schema),
             )
             .with_annotations(annotations),
+            Tool::new(
+                ACQUIRE_TOOL,
+                "[acquisition lane, D-246/D-248: decide()-gated; every action is op-logged] One verb for the corpus acquisition lane. Actions: plan (typed acquisition plan for a CLEARED work; refuses UNDETERMINED / EXCLUDE / no-record works, non-allowlisted domains, unattended mode, and the seahawk_gui transport — the last two until the S5 frozen benchmark re-passes), manifest (census a work's quarantine media dir into manifest.json: SHA-256, byte counts, sniffed types, capture methods; screenshot_derived files are never original media), verify (read-only audit: re-hash the media dir against the manifest), ingest (verify, then write the neemu ingest packet: neemu_register_work / validate_ingest / screen_work arguments — neemu itself is unchanged), lifecycle (record an extraction state, extraction evidence, or a named hold in the manifest), delete_verified (D-248 lifecycle: dry_run defaults true; real deletion only for verified_complete, unheld works, after full re-verification), sweep (read-only orphan report over the quarantine root). Requires [acquisition] enabled in policy for all but verify/sweep. Work objects carry slug, title, series, tags, source_url, determination {status, record}, tier_claim.",
+                Arc::new(acquire_schema()),
+            )
+            .with_annotations(
+                ToolAnnotations::new()
+                    .read_only(false)
+                    .destructive(true)
+                    .idempotent(false)
+                    .open_world(false),
+            ),
         ]
     }
 
@@ -3067,6 +3083,56 @@ fn convert_downstream_result(value: Value) -> CallToolResult {
     result
 }
 
+/// The `seahawk_acquire` input schema (D-246/D-248 lane verb).
+fn acquire_schema() -> Map<String, Value> {
+    let mut props = Map::new();
+    props.insert(
+        "action".to_string(),
+        json!({"type": "string", "enum": ["plan", "manifest", "verify", "ingest", "lifecycle", "delete_verified", "sweep"], "description": "The lane action to run."}),
+    );
+    props.insert(
+        "work".to_string(),
+        json!({"type": "object", "description": "Work record: slug, title, series, tags, source_url, determination {status, record}, tier_claim. Required for plan / manifest / ingest.", "properties": {"slug": {"type": "string"}, "title": {"type": "string"}, "series": {"type": "string"}, "tags": {"type": "array", "items": {"type": "string"}}, "source_url": {"type": "string"}, "determination": {"type": "object"}, "tier_claim": {"type": "string"}}, "required": ["slug", "title", "source_url", "determination"]}),
+    );
+    props.insert(
+        "slug".to_string(),
+        json!({"type": "string", "description": "Work slug (verify / lifecycle / delete_verified)."}),
+    );
+    props.insert(
+        "transport".to_string(),
+        json!({"type": "string", "enum": ["browser_harness", "seahawk_gui"], "description": "Capture transport (default browser_harness). seahawk_gui refuses until the S5 benchmark gate is green."}),
+    );
+    props.insert(
+        "mode".to_string(),
+        json!({"type": "string", "enum": ["supervised", "unattended"], "description": "Session mode (default supervised). Unattended refuses until the S5 benchmark gate is green."}),
+    );
+    props.insert(
+        "capture_methods".to_string(),
+        json!({"type": "object", "description": "Per-file capture method overrides for manifest: file name -> download | save_as_original | screenshot_derived. Unnamed files default to download."}),
+    );
+    props.insert(
+        "state".to_string(),
+        json!({"type": "string", "description": "For lifecycle: the extraction lifecycle state to record (e.g. registered, extracted_unverified, verified_complete, failed)."}),
+    );
+    props.insert(
+        "extraction".to_string(),
+        json!({"type": "object", "description": "For lifecycle: extraction evidence {record_count, output_hashes[]} checked at deletion time."}),
+    );
+    props.insert(
+        "hold".to_string(),
+        json!({"type": "string", "description": "For lifecycle: a named hold; held media is never auto-deleted."}),
+    );
+    props.insert(
+        "dry_run".to_string(),
+        json!({"type": "boolean", "description": "For delete_verified: report only (default true). Real deletion requires dry_run=false."}),
+    );
+    let mut schema = Map::new();
+    schema.insert("type".to_string(), json!("object"));
+    schema.insert("properties".to_string(), Value::Object(props));
+    schema.insert("required".to_string(), json!(["action"]));
+    schema
+}
+
 fn typed_refusal(code: &str, message: &str) -> CallToolResult {
     let mut result = CallToolResult::error(vec![ContentBlock::text(format!("{code}: {message}"))]);
     result.structured_content = Some(json!({"error": {"code": code, "message": message}}));
@@ -3079,6 +3145,194 @@ fn json_result(payload: &Value) -> CallToolResult {
     )]);
     result.structured_content = Some(payload.clone());
     result
+}
+
+impl SeahawkServer {
+    /// Runs one `seahawk_acquire` action and records it in the
+    /// op log (allowed and refused alike — D-246 evidence rule).
+    fn acquire_call(&self, args: &Value) -> CallToolResult {
+        let started = Instant::now();
+        let elapsed = || u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        match self.acquire_inner(args) {
+            Ok(payload) => {
+                self.oplog.record(
+                    ACQUIRE_TOOL,
+                    Some("acquire"),
+                    Some(args),
+                    "ok",
+                    Some(elapsed()),
+                    None,
+                );
+                json_result(&payload)
+            }
+            Err(refusal) => {
+                self.oplog.record(
+                    ACQUIRE_TOOL,
+                    Some("acquire"),
+                    Some(args),
+                    &format!("refused:{}", refusal.code),
+                    Some(elapsed()),
+                    Some(&refusal.message),
+                );
+                typed_refusal(refusal.code, &refusal.message)
+            }
+        }
+    }
+
+    /// Parses the work record + transport + mode and runs the
+    /// acquisition `decide()` gate over them.
+    fn acquire_gate(&self, args: &Value) -> Result<WorkRecord, acquisition::Refusal> {
+        let work = WorkRecord::from_json(args.get("work").unwrap_or(&Value::Null))?;
+        let transport = args
+            .get("transport")
+            .and_then(Value::as_str)
+            .map(|raw| {
+                Transport::parse(raw).ok_or_else(|| acquisition::Refusal {
+                    code: acquisition::codes::BAD_RECORD,
+                    message: format!("unknown transport {raw:?}"),
+                })
+            })
+            .transpose()?
+            .unwrap_or(Transport::BrowserHarness);
+        let mode = args
+            .get("mode")
+            .and_then(Value::as_str)
+            .map(|raw| {
+                Mode::parse(raw).ok_or_else(|| acquisition::Refusal {
+                    code: acquisition::codes::BAD_RECORD,
+                    message: format!("unknown mode {raw:?}"),
+                })
+            })
+            .transpose()?
+            .unwrap_or(Mode::Supervised);
+        acquisition::decide_acquire(&work, transport, mode, self.config.acquisition.enabled)?;
+        Ok(work)
+    }
+
+    fn acquire_slug(&self, args: &Value) -> Result<String, acquisition::Refusal> {
+        args.get("slug")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                args.get("work")
+                    .and_then(|w| w.get("slug"))
+                    .and_then(Value::as_str)
+            })
+            .filter(|s| !s.is_empty() && !s.contains('/') && !s.contains(".."))
+            .map(str::to_string)
+            .ok_or_else(|| acquisition::Refusal {
+                code: acquisition::codes::BAD_RECORD,
+                message: "a work slug is required for this action".to_string(),
+            })
+    }
+
+    /// The action dispatcher for the acquisition verb. All
+    /// filesystem work is bounded by the lane's named limits in
+    /// `acquisition.rs`; this function only routes and shapes
+    /// results.
+    fn acquire_inner(&self, args: &Value) -> Result<Value, acquisition::Refusal> {
+        let root = self.config.acquisition.quarantine_dir.clone();
+        let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+        match action {
+            "plan" => {
+                let work = self.acquire_gate(args)?;
+                let dir = acquisition::work_dir(&root, &work.slug);
+                std::fs::create_dir_all(acquisition::media_dir(&dir)).map_err(|e| {
+                    acquisition::Refusal {
+                        code: acquisition::codes::MANIFEST_INVALID,
+                        message: format!("cannot create quarantine dirs: {e}"),
+                    }
+                })?;
+                let transport = args
+                    .get("transport")
+                    .and_then(Value::as_str)
+                    .and_then(Transport::parse)
+                    .unwrap_or(Transport::BrowserHarness);
+                let mode = args
+                    .get("mode")
+                    .and_then(Value::as_str)
+                    .and_then(Mode::parse)
+                    .unwrap_or(Mode::Supervised);
+                Ok(acquisition::plan(&work, transport, mode, &root))
+            }
+            "manifest" => {
+                let work = self.acquire_gate(args)?;
+                let dir = acquisition::work_dir(&root, &work.slug);
+                let methods = acquisition::parse_methods(args)?;
+                let entries = acquisition::census_media(&acquisition::media_dir(&dir), &methods)?;
+                let manifest =
+                    acquisition::build_manifest(&work, &entries, acquisition::unix_now());
+                acquisition::write_json_atomic(&dir.join("manifest.json"), &manifest)?;
+                Ok(manifest)
+            }
+            "verify" => {
+                let slug = self.acquire_slug(args)?;
+                let dir = acquisition::work_dir(&root, &slug);
+                let manifest = acquisition::load_manifest(&dir.join("manifest.json"))?;
+                acquisition::verify_manifest(&manifest, &acquisition::media_dir(&dir))
+            }
+            "ingest" => {
+                let work = self.acquire_gate(args)?;
+                let dir = acquisition::work_dir(&root, &work.slug);
+                let manifest_path = dir.join("manifest.json");
+                let manifest = acquisition::load_manifest(&manifest_path)?;
+                acquisition::verify_manifest(&manifest, &acquisition::media_dir(&dir))?;
+                if !acquisition::manifest_has_ingestible_original(&manifest) {
+                    return Err(acquisition::Refusal {
+                        code: acquisition::codes::NO_MEDIA,
+                        message: "manifest holds no ingestible original media (a ZIP must \
+                                  be unpacked to media files before neemu ingest)"
+                            .to_string(),
+                    });
+                }
+                let packet =
+                    acquisition::ingest_packet(&work, &manifest, &acquisition::media_dir(&dir));
+                acquisition::write_json_atomic(&dir.join("ingest-packet.json"), &packet)?;
+                acquisition::record_lifecycle(&manifest_path, "ingest_prepared", None, None)?;
+                Ok(packet)
+            }
+            "lifecycle" => {
+                if !self.config.acquisition.enabled {
+                    return Err(acquisition::Refusal {
+                        code: acquisition::codes::DISABLED,
+                        message: "the acquisition lane is not enabled in policy".to_string(),
+                    });
+                }
+                let slug = self.acquire_slug(args)?;
+                let dir = acquisition::work_dir(&root, &slug);
+                let state = args
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| acquisition::Refusal {
+                        code: acquisition::codes::BAD_RECORD,
+                        message: "lifecycle requires a non-empty state".to_string(),
+                    })?;
+                let extraction = args.get("extraction").cloned();
+                let hold = args.get("hold").and_then(Value::as_str).map(str::to_string);
+                acquisition::record_lifecycle(&dir.join("manifest.json"), state, extraction, hold)
+            }
+            "delete_verified" => {
+                if !self.config.acquisition.enabled {
+                    return Err(acquisition::Refusal {
+                        code: acquisition::codes::DISABLED,
+                        message: "the acquisition lane is not enabled in policy".to_string(),
+                    });
+                }
+                let slug = self.acquire_slug(args)?;
+                let dir = acquisition::work_dir(&root, &slug);
+                let dry_run = args.get("dry_run").and_then(Value::as_bool).unwrap_or(true);
+                acquisition::execute_deletion(&dir, dry_run, acquisition::unix_now())
+            }
+            "sweep" => Ok(acquisition::sweep_report(&root)),
+            other => Err(acquisition::Refusal {
+                code: acquisition::codes::BAD_RECORD,
+                message: format!(
+                    "unknown acquisition action {other:?}; expected plan | manifest | \
+                     verify | ingest | lifecycle | delete_verified | sweep"
+                ),
+            }),
+        }
+    }
 }
 
 impl ServerHandler for SeahawkServer {
@@ -3236,6 +3490,14 @@ impl ServerHandler for SeahawkServer {
                     .clamp(1, 500);
                 let entries = self.oplog.read_recent(usize::try_from(limit).unwrap_or(50));
                 json_result(&json!({"entries": entries}))
+            }
+            ACQUIRE_TOOL => {
+                let this = self.clone();
+                tokio::task::spawn_blocking(move || this.acquire_call(&arguments))
+                    .await
+                    .map_err(|e| {
+                        McpError::internal_error(format!("acquire task failed: {e}"), None)
+                    })?
             }
             _ => {
                 let operator_token = context

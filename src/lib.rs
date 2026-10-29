@@ -35,7 +35,17 @@
 //! brokered engine code changes get structured LSP/lint/format
 //! feedback in the op log and in the result, inside a bounded
 //! fix-and-recheck episode. Feedback never writes.
+//!
+//! The acquisition lane (D-246/D-248, `acquisition` module) adds
+//! one native verb, `seahawk_acquire`: a transport-agnostic,
+//! decide()-gated pipeline that plans acquisition of
+//! CLEARED-determination works from allowlisted domains into a
+//! quarantine dir, censuses and verifies per-work manifests,
+//! prepares the neemu ingest handoff, and runs the
+//! delete-after-verified-extraction lifecycle. Neemu gains no
+//! download surface; it ingests through its existing path.
 
+pub mod acquisition;
 pub mod config;
 pub mod downstream;
 pub mod guard;
