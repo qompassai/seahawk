@@ -40,6 +40,29 @@ pub mod codes {
     /// by the configured grounder route; the call is refused
     /// before acting rather than acting unverified.
     pub const GUI_VERIFY_UNAVAILABLE: &str = "seahawk_gui_verify_unavailable";
+    /// S5 curative (C4): a frame captured for verification is
+    /// (near-)uniform — an unpainted or crashed window — and so
+    /// cannot verify anything; the act is refused rather than
+    /// judged against a blank.
+    pub const GUI_SUSPECT_BLANK: &str = "seahawk_gui_suspect_blank";
+    /// S5 curative (C4): the caller pinned a `window_id` and the
+    /// window that resolves now is a different one (or the pin
+    /// no longer resolves) — never a silent re-match by title.
+    pub const GUI_WINDOW_MISMATCH: &str = "seahawk_gui_window_mismatch";
+    /// Wiring (D-230): no configured tooling route can serve a
+    /// `code.feedback` check (server unconfigured, unspawned, or
+    /// the language unpinned) — feedback reports unavailable,
+    /// never an assumed-clean result.
+    pub const TOOLING_UNAVAILABLE: &str = "seahawk_tooling_unavailable";
+    /// Wiring (D-230): the feedback episode bound (3 calls per
+    /// workspace+files window) is exhausted and the last result
+    /// was still dirty — the caller must change strategy.
+    pub const FEEDBACK_UNRESOLVED: &str = "seahawk_code_feedback_unresolved";
+    /// Wiring (D-230): a file changed on disk while its feedback
+    /// was being computed, and the re-check still diverges — the
+    /// result would describe a file that no longer exists in
+    /// that form.
+    pub const FEEDBACK_STALE: &str = "seahawk_feedback_stale";
     pub const UNAUTHORIZED: &str = "seahawk_unauthorized";
     pub const DOWNSTREAM_UNAVAILABLE: &str = "seahawk_downstream_unavailable";
     pub const BAD_ARGUMENTS: &str = "seahawk_bad_arguments";

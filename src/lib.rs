@@ -27,6 +27,14 @@
 //! decide() lattice, verified against a fresh capture with bounded
 //! correction). Grounding is perception only; it grants no
 //! permission.
+//!
+//! The D-230 wiring adds one read-class tool, `code.feedback`,
+//! backed by a stdio tooling client (`tooling` module) of the
+//! estate's language-tooling servers (theodolite for headless
+//! diagnostics, periscope for diver's format/lint pipelines):
+//! brokered engine code changes get structured LSP/lint/format
+//! feedback in the op log and in the result, inside a bounded
+//! fix-and-recheck episode. Feedback never writes.
 
 pub mod config;
 pub mod downstream;
@@ -36,4 +44,5 @@ pub mod model;
 pub mod oplog;
 pub mod policy;
 pub mod server;
+pub mod tooling;
 pub mod vision;

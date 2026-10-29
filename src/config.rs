@@ -68,6 +68,10 @@ struct RawConfig {
     #[serde(default)]
     vision: RawVision,
     #[serde(default)]
+    tooling: Vec<RawTooling>,
+    #[serde(default)]
+    feedback: RawFeedback,
+    #[serde(default)]
     oplog: RawOplog,
 }
 
@@ -134,6 +138,97 @@ impl Default for VisionConfig {
 pub const DEFAULT_MIN_CONFIDENCE: f64 = 0.5;
 pub const DEFAULT_VISION_TIMEOUT_SECS: u64 = 120;
 pub const MAX_VISION_TIMEOUT_SECS: u64 = 600;
+
+/// One `[[tooling]]` entry (D-230 wiring): a stdio MCP server
+/// Seahawk acts as a *client* of for `code.feedback`. Entries
+/// are operator policy data — the shipped example config carries
+/// the section commented out; wiring is opt-in per deployment.
+#[derive(Debug, Deserialize)]
+struct RawTooling {
+    id: String,
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+    /// Theodolite only: file extension → theodolite server id
+    /// that answers diagnostics for it (mirrors the server
+    /// diver's `lsp/<lang>_ls.lua` selects for the language).
+    #[serde(default)]
+    diagnostics_servers: HashMap<String, String>,
+}
+
+/// The `[feedback]` bounds for `code.feedback` (SPEC §3.2):
+/// how many files one call may cover, how many feedback calls
+/// one episode (workspace + file set) may contain inside the
+/// window, and the registered engine project roots a workspace
+/// must live inside.
+#[derive(Debug, Default, Deserialize)]
+struct RawFeedback {
+    #[serde(default)]
+    max_files: Option<usize>,
+    #[serde(default)]
+    max_iterations_per_episode: Option<usize>,
+    #[serde(default)]
+    episode_window_secs: Option<u64>,
+    #[serde(default)]
+    project_roots: Vec<String>,
+}
+
+/// Which tooling server a `[[tooling]]` entry names.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ToolingId {
+    Theodolite,
+    Periscope,
+}
+
+impl ToolingId {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Theodolite => "theodolite",
+            Self::Periscope => "periscope",
+        }
+    }
+}
+
+/// Validated `[[tooling]]` entry.
+#[derive(Clone, Debug)]
+pub struct ToolingEntry {
+    pub id: ToolingId,
+    pub command: String,
+    pub args: Vec<String>,
+    pub timeout_secs: u64,
+    pub diagnostics_servers: HashMap<String, String>,
+}
+
+/// Validated `[feedback]` configuration.
+#[derive(Clone, Debug)]
+pub struct FeedbackConfig {
+    pub max_files: usize,
+    pub max_iterations_per_episode: usize,
+    pub episode_window_secs: u64,
+    pub project_roots: Vec<PathBuf>,
+}
+
+pub const DEFAULT_FEEDBACK_MAX_FILES: usize = 16;
+pub const MAX_FEEDBACK_FILES: usize = 16;
+pub const DEFAULT_FEEDBACK_MAX_ITERATIONS: usize = 3;
+pub const DEFAULT_FEEDBACK_EPISODE_WINDOW_SECS: u64 = 600;
+pub const DEFAULT_TOOLING_TIMEOUT_SECS: u64 = 120;
+pub const MAX_TOOLING_TIMEOUT_SECS: u64 = 600;
+pub const MAX_TOOLING_ENTRIES: usize = 4;
+pub const MAX_PROJECT_ROOTS: usize = 32;
+
+impl Default for FeedbackConfig {
+    fn default() -> Self {
+        Self {
+            max_files: DEFAULT_FEEDBACK_MAX_FILES,
+            max_iterations_per_episode: DEFAULT_FEEDBACK_MAX_ITERATIONS,
+            episode_window_secs: DEFAULT_FEEDBACK_EPISODE_WINDOW_SECS,
+            project_roots: Vec::new(),
+        }
+    }
+}
 
 #[derive(Debug, Default, Deserialize)]
 struct RawGui {
@@ -237,6 +332,10 @@ pub struct Config {
     pub gui_apps: Vec<GuiApp>,
     /// S5 vision-grounder configuration.
     pub vision: VisionConfig,
+    /// D-230 wiring: configured tooling servers (client side).
+    pub tooling: Vec<ToolingEntry>,
+    /// D-230 wiring: `code.feedback` bounds + project roots.
+    pub feedback: FeedbackConfig,
     pub oplog_path: PathBuf,
 }
 
@@ -305,6 +404,8 @@ impl Config {
         }
         let gui_apps = parse_gui_apps(&raw.gui)?;
         let vision = parse_vision(&raw.vision)?;
+        let tooling = parse_tooling(&raw.tooling)?;
+        let feedback = parse_feedback(&raw.feedback)?;
         Ok(Self {
             agent_token_digest: digest(&raw.server.agent_token),
             operator_token_digest: raw.server.operator_token.as_deref().map(digest),
@@ -326,6 +427,8 @@ impl Config {
             class_overrides,
             gui_apps,
             vision,
+            tooling,
+            feedback,
             oplog_path: raw.oplog.path,
         })
     }
@@ -345,6 +448,11 @@ impl Config {
 
     pub fn actuate_is_enabled(&self, tool_name: &str) -> bool {
         self.actuate_enabled.contains(&tool_name.to_lowercase())
+    }
+
+    /// A configured tooling entry by id (D-230 wiring).
+    pub fn tooling_entry(&self, id: ToolingId) -> Option<&ToolingEntry> {
+        self.tooling.iter().find(|entry| entry.id == id)
     }
 
     /// A registered GUI application by registration name
@@ -371,6 +479,105 @@ fn valid_gui_app_name(name: &str) -> bool {
         return false;
     }
     chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
+/// Validates the `[[tooling]]` entries. Commands are operator
+/// policy (the operator is the trust root for this file, as
+/// everywhere in this config); what validation guarantees is
+/// shape: known ids, no duplicates, bounded fields, sane
+/// timeouts — a typo fails at load, not mid-feedback.
+fn parse_tooling(raw: &[RawTooling]) -> anyhow::Result<Vec<ToolingEntry>> {
+    if raw.len() > MAX_TOOLING_ENTRIES {
+        bail!(
+            "config: [[tooling]] carries {} entries; the bound is {MAX_TOOLING_ENTRIES}",
+            raw.len()
+        );
+    }
+    let mut entries: Vec<ToolingEntry> = Vec::with_capacity(raw.len());
+    for entry in raw {
+        let id = match entry.id.as_str() {
+            "theodolite" => ToolingId::Theodolite,
+            "periscope" => ToolingId::Periscope,
+            other => bail!("config: [[tooling]] id {other:?} is not one of theodolite | periscope"),
+        };
+        if entries.iter().any(|e: &ToolingEntry| e.id == id) {
+            bail!("config: [[tooling]] id {:?} is configured twice", entry.id);
+        }
+        if entry.command.is_empty() || entry.command.chars().count() > 512 {
+            bail!(
+                "config: [[tooling]] {:?} command must be 1..=512 characters",
+                entry.id
+            );
+        }
+        if entry.args.len() > 16 || entry.args.iter().any(|arg| arg.chars().count() > 512) {
+            bail!(
+                "config: [[tooling]] {:?} args must be at most 16 entries of at most 512 characters",
+                entry.id
+            );
+        }
+        let timeout_secs = entry.timeout_secs.unwrap_or(DEFAULT_TOOLING_TIMEOUT_SECS);
+        if timeout_secs == 0 || timeout_secs > MAX_TOOLING_TIMEOUT_SECS {
+            bail!(
+                "config: [[tooling]] {:?} timeout_secs must be within 1..={MAX_TOOLING_TIMEOUT_SECS}",
+                entry.id
+            );
+        }
+        if entry.diagnostics_servers.len() > 32
+            || entry.diagnostics_servers.iter().any(|(ext, server)| {
+                ext.is_empty() || ext.len() > 16 || server.is_empty() || server.len() > 64
+            })
+        {
+            bail!(
+                "config: [[tooling]] {:?} diagnostics_servers must map at most 32 short extensions to server ids",
+                entry.id
+            );
+        }
+        entries.push(ToolingEntry {
+            id,
+            command: entry.command.clone(),
+            args: entry.args.clone(),
+            timeout_secs,
+            diagnostics_servers: entry.diagnostics_servers.clone(),
+        });
+    }
+    Ok(entries)
+}
+
+/// Validates the `[feedback]` section.
+fn parse_feedback(raw: &RawFeedback) -> anyhow::Result<FeedbackConfig> {
+    let mut feedback = FeedbackConfig::default();
+    if let Some(max_files) = raw.max_files {
+        if max_files == 0 || max_files > MAX_FEEDBACK_FILES {
+            bail!("config: feedback.max_files must be within 1..={MAX_FEEDBACK_FILES}");
+        }
+        feedback.max_files = max_files;
+    }
+    if let Some(max_iterations) = raw.max_iterations_per_episode {
+        if max_iterations == 0 || max_iterations > 10 {
+            bail!("config: feedback.max_iterations_per_episode must be within 1..=10");
+        }
+        feedback.max_iterations_per_episode = max_iterations;
+    }
+    if let Some(window) = raw.episode_window_secs {
+        if !(10..=86400).contains(&window) {
+            bail!("config: feedback.episode_window_secs must be within 10..=86400");
+        }
+        feedback.episode_window_secs = window;
+    }
+    if raw.project_roots.len() > MAX_PROJECT_ROOTS {
+        bail!(
+            "config: feedback.project_roots carries {}; the bound is {MAX_PROJECT_ROOTS}",
+            raw.project_roots.len()
+        );
+    }
+    for root in &raw.project_roots {
+        let path = PathBuf::from(root);
+        if !path.is_absolute() {
+            bail!("config: feedback.project_roots entries must be absolute paths (got {root:?})");
+        }
+        feedback.project_roots.push(path);
+    }
+    Ok(feedback)
 }
 
 fn parse_gui_apps(raw: &RawGui) -> anyhow::Result<Vec<GuiApp>> {
@@ -580,6 +787,41 @@ mod tests {
         let cfg = Config::parse(text).expect("config");
         assert!(cfg.execute_is_enabled("some.toolset.runit"));
         assert_eq!(cfg.class_of("OTHER.TOOL"), Some(ToolClass::Execute));
+    }
+
+    #[test]
+    fn tooling_and_feedback_parse_and_validate() {
+        let text = "[server]\nagent_token = \"x\"\n\
+                    [[tooling]]\nid = \"theodolite\"\ncommand = \"/usr/bin/theodolite\"\n\
+                    diagnostics_servers = { rs = \"bacon-ls\", py = \"basedpyright\" }\n\
+                    [[tooling]]\nid = \"periscope\"\ncommand = \"/usr/bin/periscope\"\ntimeout_secs = 30\n\
+                    [feedback]\nmax_files = 8\nproject_roots = [\"/srv/project\"]\n";
+        let cfg = Config::parse(text).expect("config");
+        assert_eq!(cfg.tooling.len(), 2);
+        let theo = cfg
+            .tooling_entry(ToolingId::Theodolite)
+            .expect("theodolite");
+        assert_eq!(
+            theo.diagnostics_servers.get("rs").map(String::as_str),
+            Some("bacon-ls")
+        );
+        assert_eq!(cfg.feedback.max_files, 8);
+        assert_eq!(
+            cfg.feedback.max_iterations_per_episode,
+            DEFAULT_FEEDBACK_MAX_ITERATIONS
+        );
+        assert_eq!(cfg.feedback.project_roots.len(), 1);
+        // Unknown id, duplicate id, relative root, over-bound files: refused.
+        let bad_id =
+            "[server]\nagent_token = \"x\"\n[[tooling]]\nid = \"ardor\"\ncommand = \"/x\"\n";
+        assert!(Config::parse(bad_id).is_err());
+        let dup = "[server]\nagent_token = \"x\"\n[[tooling]]\nid = \"periscope\"\ncommand = \"/x\"\n[[tooling]]\nid = \"periscope\"\ncommand = \"/y\"\n";
+        assert!(Config::parse(dup).is_err());
+        let rel_root =
+            "[server]\nagent_token = \"x\"\n[feedback]\nproject_roots = [\"relative/path\"]\n";
+        assert!(Config::parse(rel_root).is_err());
+        let too_many = "[server]\nagent_token = \"x\"\n[feedback]\nmax_files = 99\n";
+        assert!(Config::parse(too_many).is_err());
     }
 
     #[test]

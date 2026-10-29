@@ -187,24 +187,122 @@ impl FrameStore {
 // The grounder seam
 // ---------------------------------------------------------------------------
 
+/// An element bounding box on the grounder's 0..=1000 relative
+/// scale (S5 curative round, C1): the grounder localizes BOTH
+/// edges of the element instead of estimating its centre
+/// directly. The S5 frozen benchmark's aim bias — points landing
+/// on the element's trailing/bottom edge, 3–19 px outside the
+/// text extent while inside the element — is the failure mode of
+/// direct centre estimation: the model's point estimate drifts
+/// to the end of the text it read. A box makes the centre an
+/// arithmetic derivation, not a second estimate.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RelBBox {
+    pub x_min: f64,
+    pub y_min: f64,
+    pub x_max: f64,
+    pub y_max: f64,
+}
+
+impl RelBBox {
+    /// The box centre on the relative scale.
+    pub fn center(&self) -> (f64, f64) {
+        (
+            (self.x_min + self.x_max) / 2.0,
+            (self.y_min + self.y_max) / 2.0,
+        )
+    }
+
+    /// Validates the box: ordered edges, on the 0..=1000 scale,
+    /// non-degenerate in both axes.
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("x_min", self.x_min),
+            ("y_min", self.y_min),
+            ("x_max", self.x_max),
+            ("y_max", self.y_max),
+        ] {
+            if !(0.0..=1000.0).contains(&value) {
+                return Err(format!("bbox {name} {value} is off the 0..=1000 scale"));
+            }
+        }
+        if self.x_max <= self.x_min || self.y_max <= self.y_min {
+            return Err(format!(
+                "bbox is degenerate or inverted: [{},{}]-[{},{}]",
+                self.x_min, self.y_min, self.x_max, self.y_max
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// An element bounding box in frame pixels (window-relative).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct PixelBBox {
+    pub x_min: i32,
+    pub y_min: i32,
+    pub x_max: i32,
+    pub y_max: i32,
+}
+
+impl PixelBBox {
+    pub fn center(&self) -> (i32, i32) {
+        ((self.x_min + self.x_max) / 2, (self.y_min + self.y_max) / 2)
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "x_min": self.x_min,
+            "y_min": self.y_min,
+            "x_max": self.x_max,
+            "y_max": self.y_max,
+        })
+    }
+}
+
+/// Converts a relative box into frame pixels, clamped into the
+/// frame.
+pub fn pixel_bbox_from_rel(rel: RelBBox, frame: &Frame) -> PixelBBox {
+    let w = i32::try_from(frame.width).unwrap_or(0);
+    let h = i32::try_from(frame.height).unwrap_or(0);
+    let conv =
+        |value: f64, extent: i32| -> i32 { ((value / 1000.0) * f64::from(extent)).round() as i32 };
+    PixelBBox {
+        x_min: conv(rel.x_min, w).clamp(0, w.saturating_sub(1).max(0)),
+        y_min: conv(rel.y_min, h).clamp(0, h.saturating_sub(1).max(0)),
+        x_max: conv(rel.x_max, w).clamp(0, w.saturating_sub(1).max(0)),
+        y_max: conv(rel.y_max, h).clamp(0, h.saturating_sub(1).max(0)),
+    }
+}
+
 /// A grounder's raw answer: the target's center on a 0..=1000
 /// relative scale (the scale vision models are asked to answer
 /// in, independent of the frame's pixel size), plus confidence.
+/// `bbox` carries the element bounds when the grounder supplies
+/// them (the C1 curative shape); when present it is
+/// authoritative — `rel_x`/`rel_y` are then the box centre, set
+/// by the parser, never a separate model estimate.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RawGrounding {
     pub rel_x: f64,
     pub rel_y: f64,
     pub confidence: f64,
+    pub bbox: Option<RelBBox>,
 }
 
 /// A grounding resolved to pixels in a concrete frame:
 /// window-relative coordinates (the actuation surface's native
-/// frame), ready for confinement checks.
+/// frame), ready for confinement checks. `x`/`y` are the act
+/// point: the bbox centre when the grounder supplied a box
+/// (C1), otherwise the converted point estimate. `bbox` is
+/// `None` only for a point-only answer (labelled as such in
+/// results: its evidence crop stands in as the bounds record).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GroundHit {
     pub x: i32,
     pub y: i32,
     pub confidence: f64,
+    pub bbox: Option<PixelBBox>,
 }
 
 /// The pluggable grounding engine. Implementations must be
@@ -224,44 +322,87 @@ pub trait Grounder: Send + Sync {
 /// Coordinates are clamped into the frame: a model answering a
 /// hair outside the edge is imprecise, not malicious, and the
 /// confinement check downstream remains the hard boundary.
+/// When the answer carries a bbox, the act point is the box
+/// centre (C1: the curative correction for the S5 trailing-edge
+/// aim bias — the centre is derived, never estimated), and
+/// conversion rounds instead of truncating (truncation added a
+/// further systematic sub-pixel drift toward the origin).
 pub fn hit_from_raw(raw: RawGrounding, frame: &Frame) -> GroundHit {
-    let x = (raw.rel_x / 1000.0 * f64::from(frame.width)) as i32;
-    let y = (raw.rel_y / 1000.0 * f64::from(frame.height)) as i32;
+    let max_x = i32::try_from(frame.width).unwrap_or(0).saturating_sub(1);
+    let max_y = i32::try_from(frame.height).unwrap_or(0).saturating_sub(1);
+    if let Some(rel) = raw.bbox {
+        let bbox = pixel_bbox_from_rel(rel, frame);
+        let (cx, cy) = bbox.center();
+        return GroundHit {
+            x: cx.clamp(0, max_x),
+            y: cy.clamp(0, max_y),
+            confidence: raw.confidence,
+            bbox: Some(bbox),
+        };
+    }
+    let x = (raw.rel_x / 1000.0 * f64::from(frame.width)).round() as i32;
+    let y = (raw.rel_y / 1000.0 * f64::from(frame.height)).round() as i32;
     GroundHit {
-        x: x.clamp(0, i32::try_from(frame.width).unwrap_or(0).saturating_sub(1)),
-        y: y.clamp(
-            0,
-            i32::try_from(frame.height).unwrap_or(0).saturating_sub(1),
-        ),
+        x: x.clamp(0, max_x),
+        y: y.clamp(0, max_y),
         confidence: raw.confidence,
+        bbox: None,
     }
 }
 
 /// Validates an agent-supplied answer (the protocol route):
 /// window-relative pixel coordinates inside the frame and a
 /// confidence within 0..=1. Anything else is an argument error,
-/// refused before the answer is used.
+/// refused before the answer is used. An optional pixel bbox
+/// may accompany the point (C1); when it is present and valid,
+/// the act point becomes the box centre — the same derivation
+/// as the local route, so both routes aim identically.
 pub fn hit_from_agent_answer(
     frame: &Frame,
     x: i64,
     y: i64,
     confidence: f64,
+    bbox: Option<PixelBBox>,
 ) -> GuiResult<GroundHit> {
+    if !(0.0..=1.0).contains(&confidence) {
+        return Err(GuiError::bad_arguments(
+            "agent_answer confidence must be within 0.0..=1.0",
+        ));
+    }
+    if let Some(bbox) = bbox {
+        let (w, h) = (i64::from(frame.width), i64::from(frame.height));
+        let inside = (0..w).contains(&i64::from(bbox.x_min))
+            && (0..w).contains(&i64::from(bbox.x_max))
+            && (0..h).contains(&i64::from(bbox.y_min))
+            && (0..h).contains(&i64::from(bbox.y_max))
+            && bbox.x_max > bbox.x_min
+            && bbox.y_max > bbox.y_min;
+        if !inside {
+            return Err(GuiError::bad_arguments(format!(
+                "agent_answer bbox [{},{}]-[{},{}] is degenerate or outside the \
+                 frame ({}x{})",
+                bbox.x_min, bbox.y_min, bbox.x_max, bbox.y_max, frame.width, frame.height
+            )));
+        }
+        let (cx, cy) = bbox.center();
+        return Ok(GroundHit {
+            x: cx,
+            y: cy,
+            confidence,
+            bbox: Some(bbox),
+        });
+    }
     if !(0..i64::from(frame.width)).contains(&x) || !(0..i64::from(frame.height)).contains(&y) {
         return Err(GuiError::bad_arguments(format!(
             "agent_answer point {x},{y} is outside the frame ({}x{})",
             frame.width, frame.height
         )));
     }
-    if !(0.0..=1.0).contains(&confidence) {
-        return Err(GuiError::bad_arguments(
-            "agent_answer confidence must be within 0.0..=1.0",
-        ));
-    }
     Ok(GroundHit {
         x: i32::try_from(x).unwrap_or(0),
         y: i32::try_from(y).unwrap_or(0),
         confidence,
+        bbox: None,
     })
 }
 
@@ -271,10 +412,13 @@ pub fn hit_from_agent_answer(
 
 const GROUND_PROMPT: &str = "You are the vision grounding engine of a GUI automation broker. \
 Look at the screenshot and locate the UI element described at the end of this prompt. \
-Reply with ONLY a JSON object of the form {\"found\": true, \"x\": <number>, \"y\": <number>, \
-\"confidence\": <number>} where x and y are the coordinates of the CENTER of the element on a \
+Reply with ONLY a JSON object of the form {\"found\": true, \"x_min\": <number>, \
+\"y_min\": <number>, \"x_max\": <number>, \"y_max\": <number>, \"confidence\": <number>} where \
+x_min/y_min are the element's TOP-LEFT corner and x_max/y_max its BOTTOM-RIGHT corner — the \
+bounds of the whole clickable widget (tab, button, menu entry, row), not just its text — on a \
 0 to 1000 scale relative to the image (x: 0 = left edge, 1000 = right edge; y: 0 = top edge, \
-1000 = bottom edge) and confidence is your certainty between 0 and 1. If the element is not \
+1000 = bottom edge) and confidence is your certainty between 0 and 1. Localize BOTH edges \
+carefully: the broker clicks the centre it derives from your box. If the element is not \
 visible in the screenshot, reply {\"found\": false}. No other text. Element: ";
 
 const PRESENCE_PROMPT_PREFIX: &str = "Does this screenshot visibly contain the exact text \"";
@@ -411,6 +555,13 @@ fn extract_json_object(reply: &str) -> Option<Value> {
 /// Parses a grounding reply. `found: false`, missing fields, or
 /// coordinates off the 0..=1000 scale are typed ground failures —
 /// the broker would rather refuse than click a hallucination.
+/// The C1 shape carries a bbox (`x_min`/`y_min`/`x_max`/`y_max`):
+/// when all four are present they must validate, and the point
+/// becomes the box centre. A point-only reply (`x`/`y`, the
+/// pre-C1 shape) is still accepted — it degrades to a point
+/// answer with no bbox, labelled as such downstream — so a model
+/// that ignores the box instruction fails soft, never silently
+/// "succeeds" with invented bounds.
 pub fn parse_ground_reply(reply: &str) -> GuiResult<RawGrounding> {
     let Some(object) = extract_json_object(reply) else {
         return Err(GuiError::new(
@@ -424,13 +575,45 @@ pub fn parse_ground_reply(reply: &str) -> GuiResult<RawGrounding> {
             "the grounder reports the target is not visible in the frame".to_string(),
         ));
     }
+    // A missing confidence is read as 0.5: models omit it often,
+    // and the configured floor then decides honestly.
+    let confidence = object
+        .get("confidence")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.5)
+        .clamp(0.0, 1.0);
+    let bbox_fields =
+        ["x_min", "y_min", "x_max", "y_max"].map(|key| object.get(key).and_then(Value::as_f64));
+    if let [Some(x_min), Some(y_min), Some(x_max), Some(y_max)] = bbox_fields {
+        let bbox = RelBBox {
+            x_min,
+            y_min,
+            x_max,
+            y_max,
+        };
+        if let Err(reason) = bbox.validate() {
+            return Err(GuiError::new(
+                codes::GUI_GROUND_FAILED,
+                format!("the grounder answered an invalid bbox: {reason}"),
+            ));
+        }
+        let (rel_x, rel_y) = bbox.center();
+        return Ok(RawGrounding {
+            rel_x,
+            rel_y,
+            confidence,
+            bbox: Some(bbox),
+        });
+    }
     let (Some(x), Some(y)) = (
         object.get("x").and_then(Value::as_f64),
         object.get("y").and_then(Value::as_f64),
     ) else {
         return Err(GuiError::new(
             codes::GUI_GROUND_FAILED,
-            "the grounder's reply has no numeric x/y".to_string(),
+            "the grounder's reply has neither a bbox (x_min/y_min/x_max/y_max) \
+             nor numeric x/y"
+                .to_string(),
         ));
     };
     if !(0.0..=1000.0).contains(&x) || !(0.0..=1000.0).contains(&y) {
@@ -439,17 +622,11 @@ pub fn parse_ground_reply(reply: &str) -> GuiResult<RawGrounding> {
             format!("the grounder answered off-scale coordinates {x},{y} (scale is 0..=1000)"),
         ));
     }
-    // A missing confidence is read as 0.5: models omit it often,
-    // and the configured floor then decides honestly.
-    let confidence = object
-        .get("confidence")
-        .and_then(Value::as_f64)
-        .unwrap_or(0.5)
-        .clamp(0.0, 1.0);
     Ok(RawGrounding {
         rel_x: x,
         rel_y: y,
         confidence,
+        bbox: None,
     })
 }
 
@@ -558,11 +735,70 @@ pub fn evidence_crop(frame: &Frame, cx: i32, cy: i32) -> GuiResult<Frame> {
     })
 }
 
+/// Per-channel tolerance of the blank-frame screen (C4): a
+/// pixel counts as "the frame's single colour" when every
+/// channel is within this distance of the reference colour.
+pub const BLANK_CHANNEL_TOLERANCE: u8 = 10;
+/// Fraction of pixels that must match the single colour for a
+/// frame to be suspected blank (SPEC §6.1 step 3: >99%).
+pub const BLANK_FRACTION: f64 = 0.99;
+
+/// The content class of a frame (C4 blank-frame screen, Phoenix
+/// REQ-2): a frame whose pixels are (nearly) all one colour
+/// carries no verifiable content — an unpainted window, a
+/// crashed renderer — whatever its capture reported.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameContent {
+    Content,
+    SuspectBlank,
+}
+
+/// Classifies a frame by the blank-frame screen: decode, take
+/// the first pixel as the reference colour, and count pixels
+/// within BLANK_CHANNEL_TOLERANCE of it on every channel. Above
+/// BLANK_FRACTION the frame is `SuspectBlank`. A decode failure
+/// is a typed failure, never a silent "content" verdict.
+pub fn frame_content(frame: &Frame) -> GuiResult<FrameContent> {
+    let (rgb, _, _) = decode_png_rgb(frame)?;
+    if rgb.len() < 3 {
+        return Ok(FrameContent::SuspectBlank);
+    }
+    let reference = [rgb[0], rgb[1], rgb[2]];
+    let total = rgb.len() / 3;
+    let matching = rgb
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .filter(|px| (0..3).all(|c| px[c].abs_diff(reference[c]) <= BLANK_CHANNEL_TOLERANCE))
+        .count();
+    let fraction = matching as f64 / total.max(1) as f64;
+    Ok(if fraction > BLANK_FRACTION {
+        FrameContent::SuspectBlank
+    } else {
+        FrameContent::Content
+    })
+}
+
 /// Fraction of pixels in the region around (cx, cy) whose color
 /// changed between two frames by more than DIFF_PIXEL_THRESHOLD
 /// in any channel. Frames of different sizes are a typed failure:
 /// the comparison would be meaningless.
 pub fn region_diff_fraction(a: &Frame, b: &Frame, cx: i32, cy: i32) -> GuiResult<f64> {
+    region_diff_fraction_ranged(a, b, cx, cy, DIFF_REGION_HALF)
+}
+
+/// `region_diff_fraction` with an explicit half-size. A very
+/// large half-size covers the whole frame (the clamps bound the
+/// region to the frame), which is how the full-frame mode of
+/// the `changed` check (C3) is expressed.
+pub fn region_diff_fraction_ranged(
+    a: &Frame,
+    b: &Frame,
+    cx: i32,
+    cy: i32,
+    half: i32,
+) -> GuiResult<f64> {
     if a.width != b.width || a.height != b.height {
         return Err(GuiError::failed(format!(
             "cannot diff frames of different sizes ({}x{} vs {}x{})",
@@ -572,10 +808,10 @@ pub fn region_diff_fraction(a: &Frame, b: &Frame, cx: i32, cy: i32) -> GuiResult
     let (pa, _, _) = decode_png_rgb(a)?;
     let (pb, _, _) = decode_png_rgb(b)?;
     let (w, h) = (a.width as i32, a.height as i32);
-    let x0 = (cx - DIFF_REGION_HALF).clamp(0, w);
-    let x1 = (cx + DIFF_REGION_HALF + 1).clamp(0, w);
-    let y0 = (cy - DIFF_REGION_HALF).clamp(0, h);
-    let y1 = (cy + DIFF_REGION_HALF + 1).clamp(0, h);
+    let x0 = (cx - half).clamp(0, w);
+    let x1 = (cx + half + 1).clamp(0, w);
+    let y0 = (cy - half).clamp(0, h);
+    let y1 = (cy + half + 1).clamp(0, h);
     if x1 <= x0 || y1 <= y0 {
         return Err(GuiError::failed(format!(
             "diff region around {cx},{cy} is empty in a {w}x{h} frame"
@@ -608,6 +844,19 @@ pub fn region_diff_fraction(a: &Frame, b: &Frame, cx: i32, cy: i32) -> GuiResult
 pub struct Expectation {
     /// The frame region around the action point changed.
     pub changed: Option<bool>,
+    /// C3 anchor for the `changed` check: diff the region
+    /// centred on this window-relative point instead of the
+    /// action point — for effects that anchor away from where
+    /// the action landed (menus at the top-left, Blender's F3
+    /// search at the top-right; S5 finding G-1).
+    pub changed_around: Option<(i32, i32)>,
+    /// C3: diff the whole frame for the `changed` check instead
+    /// of a region. Also the broker's own default for actions
+    /// that carry no point (key presses): a point-less action
+    /// has no meaningful "region around the point", and the S5
+    /// window-centre fallback is exactly what made menu closes
+    /// unverifiable (G-1).
+    pub full_frame: bool,
     /// The target window's title contains this text
     /// (case-insensitive) after the action.
     pub title_contains: Option<String>,
@@ -650,6 +899,28 @@ impl Expectation {
                         GuiError::bad_arguments("\"expect.changed\" must be a boolean")
                     })?);
                 }
+                "changed_around" => {
+                    let (Some(x), Some(y)) = (
+                        value.get("x").and_then(Value::as_i64),
+                        value.get("y").and_then(Value::as_i64),
+                    ) else {
+                        return Err(GuiError::bad_arguments(
+                            "\"expect.changed_around\" must be an object with \
+                             integer x and y (window-relative)",
+                        ));
+                    };
+                    let (Ok(x), Ok(y)) = (i32::try_from(x), i32::try_from(y)) else {
+                        return Err(GuiError::bad_arguments(
+                            "\"expect.changed_around\" coordinates are out of range",
+                        ));
+                    };
+                    parsed.changed_around = Some((x, y));
+                }
+                "full_frame" => {
+                    parsed.full_frame = value.as_bool().ok_or_else(|| {
+                        GuiError::bad_arguments("\"expect.full_frame\" must be a boolean")
+                    })?;
+                }
                 "title_contains" => {
                     parsed.title_contains = Some(
                         value
@@ -690,7 +961,8 @@ impl Expectation {
                 other => {
                     return Err(GuiError::bad_arguments(format!(
                         "unknown \"expect\" key {other:?}: the checks are changed | \
-                         title_contains | focused | text_visible, plus a free-text \
+                         title_contains | focused | text_visible, the changed-check \
+                         anchors changed_around | full_frame, plus a free-text \
                          description"
                     )));
                 }
@@ -728,13 +1000,38 @@ pub fn evaluate_checks(
 ) -> Vec<CheckOutcome> {
     let mut outcomes = Vec::new();
     if let Some(want_changed) = expect.changed {
-        let (passed, detail) = match region_diff_fraction(pre, post, point.0, point.1) {
+        // Where the diff looks (C3): an explicit anchor wins,
+        // then full-frame mode, then the region around the
+        // action point (the pre-C3 default, unchanged).
+        let (mode, diff) = if let Some((ax, ay)) = expect.changed_around {
+            (
+                format!("anchored at {ax},{ay}"),
+                region_diff_fraction(pre, post, ax, ay),
+            )
+        } else if expect.full_frame {
+            (
+                "full frame".to_string(),
+                region_diff_fraction_ranged(
+                    pre,
+                    post,
+                    i32::try_from(pre.width / 2).unwrap_or(0),
+                    i32::try_from(pre.height / 2).unwrap_or(0),
+                    i32::MAX / 2,
+                ),
+            )
+        } else {
+            (
+                format!("region around {},{}", point.0, point.1),
+                region_diff_fraction(pre, post, point.0, point.1),
+            )
+        };
+        let (passed, detail) = match diff {
             Ok(fraction) => {
                 let observed_changed = fraction >= DIFF_CHANGED_FRACTION;
                 (
                     observed_changed == want_changed,
                     format!(
-                        "region diff fraction {fraction:.4} (threshold {DIFF_CHANGED_FRACTION})"
+                        "{mode} diff fraction {fraction:.4} (threshold {DIFF_CHANGED_FRACTION})"
                     ),
                 )
             }
@@ -866,6 +1163,7 @@ mod tests {
                 rel_x: 500.0,
                 rel_y: 250.0,
                 confidence: 0.9,
+                bbox: None,
             },
             &frame,
         );
@@ -875,6 +1173,7 @@ mod tests {
                 rel_x: 1000.0,
                 rel_y: 1000.0,
                 confidence: 1.0,
+                bbox: None,
             },
             &frame,
         );
@@ -884,12 +1183,12 @@ mod tests {
     #[test]
     fn agent_answer_is_bounds_checked() {
         let frame = solid_frame(100, 50, [0, 0, 0]);
-        assert!(hit_from_agent_answer(&frame, 50, 25, 0.8).is_ok());
-        match hit_from_agent_answer(&frame, 100, 25, 0.8) {
+        assert!(hit_from_agent_answer(&frame, 50, 25, 0.8, None).is_ok());
+        match hit_from_agent_answer(&frame, 100, 25, 0.8, None) {
             Err(e) => assert_eq!(e.code, codes::BAD_ARGUMENTS),
             Ok(h) => panic!("out-of-frame answer accepted: {h:?}"),
         }
-        match hit_from_agent_answer(&frame, 50, 25, 1.5) {
+        match hit_from_agent_answer(&frame, 50, 25, 1.5, None) {
             Err(e) => assert_eq!(e.code, codes::BAD_ARGUMENTS),
             Ok(h) => panic!("over-confident answer accepted: {h:?}"),
         }
@@ -983,6 +1282,7 @@ mod tests {
                 rel_x: 500.0,
                 rel_y: 500.0,
                 confidence: 0.99,
+                bbox: None,
             })
         }
         fn text_present(&self, _frame: &Frame, _text: &str) -> GuiResult<bool> {
@@ -1011,5 +1311,170 @@ mod tests {
                 .iter()
                 .any(|o| !o.passed && o.check == "text_visible")
         );
+    }
+
+    // ---- S5 curative round (C1/C3/C4) ----
+
+    #[test]
+    fn bbox_reply_aims_at_the_box_centre_not_the_trailing_edge() {
+        // The S5 failure shape: a tab whose text extent ends at
+        // rel x=389 while the widget runs to 420. A point answer
+        // at the text's trailing edge (395) missed the text box;
+        // the box answer's centre is derived arithmetically.
+        let parsed = parse_ground_reply(
+            "{\"found\": true, \"x_min\": 340, \"y_min\": 10, \"x_max\": 420, \
+             \"y_max\": 30, \"confidence\": 0.95}",
+        )
+        .expect("bbox reply");
+        let bbox = parsed.bbox.expect("bbox carried");
+        assert_eq!((parsed.rel_x, parsed.rel_y), (380.0, 20.0));
+        assert_eq!(bbox.x_max, 420.0);
+        let frame = solid_frame(1000, 500, [1, 2, 3]);
+        let hit = hit_from_raw(parsed, &frame);
+        assert_eq!((hit.x, hit.y), (380, 10));
+        assert_eq!(
+            hit.bbox,
+            Some(PixelBBox {
+                x_min: 340,
+                y_min: 5,
+                x_max: 420,
+                y_max: 15
+            })
+        );
+    }
+
+    #[test]
+    fn bbox_reply_must_validate() {
+        for bad in [
+            "{\"x_min\": 500, \"y_min\": 10, \"x_max\": 400, \"y_max\": 30}",
+            "{\"x_min\": 100, \"y_min\": 10, \"x_max\": 100, \"y_max\": 30}",
+            "{\"x_min\": -5, \"y_min\": 10, \"x_max\": 400, \"y_max\": 30}",
+            "{\"x_min\": 100, \"y_min\": 10, \"x_max\": 1200, \"y_max\": 30}",
+        ] {
+            match parse_ground_reply(bad) {
+                Err(e) => assert_eq!(e.code, codes::GUI_GROUND_FAILED, "{bad}"),
+                Ok(r) => panic!("invalid bbox accepted: {bad} -> {r:?}"),
+            }
+        }
+        // A point-only reply still parses (degraded, no bbox).
+        let point = parse_ground_reply("{\"x\": 250, \"y\": 250}").expect("point reply");
+        assert_eq!(point.bbox, None);
+    }
+
+    #[test]
+    fn agent_answer_with_bbox_aims_at_its_centre() {
+        let frame = solid_frame(400, 200, [0, 0, 0]);
+        let bbox = PixelBBox {
+            x_min: 100,
+            y_min: 40,
+            x_max: 180,
+            y_max: 60,
+        };
+        // The caller's point sits at the box's trailing edge; the
+        // derived centre is what gets acted on.
+        let hit = hit_from_agent_answer(&frame, 179, 59, 0.9, Some(bbox)).expect("hit");
+        assert_eq!((hit.x, hit.y), (140, 50));
+        assert_eq!(hit.bbox, Some(bbox));
+        let outside = PixelBBox {
+            x_min: 390,
+            y_min: 40,
+            x_max: 450,
+            y_max: 60,
+        };
+        assert!(hit_from_agent_answer(&frame, 10, 10, 0.9, Some(outside)).is_err());
+    }
+
+    #[test]
+    fn blank_frame_screen_flags_uniform_frames_only() {
+        let blank = solid_frame(64, 64, [12, 12, 14]);
+        assert_eq!(
+            frame_content(&blank).expect("screen"),
+            FrameContent::SuspectBlank
+        );
+        // Two-tone frame: half dark, half bright — real content.
+        let mut data = Vec::new();
+        for row in 0..64 {
+            for _ in 0..64 {
+                data.extend_from_slice(if row < 32 {
+                    &[0, 0, 0]
+                } else {
+                    &[250, 250, 250]
+                });
+            }
+        }
+        let content = Frame {
+            png: encode_png_rgb(&data, 64, 64).expect("encode"),
+            width: 64,
+            height: 64,
+        };
+        assert_eq!(
+            frame_content(&content).expect("screen"),
+            FrameContent::Content
+        );
+    }
+
+    #[test]
+    fn changed_check_honours_anchor_and_full_frame() {
+        // Change confined to the top-left corner: invisible to a
+        // centre-region diff (the S5 G-1 failure), visible to an
+        // anchored diff and to a full-frame diff.
+        let (w, h) = (400usize, 400usize);
+        let a = vec![0u8; w * h * 3];
+        let mut b = vec![0u8; w * h * 3];
+        for row in 0..60 {
+            for col in 0..60 {
+                let idx = (row * w + col) * 3;
+                b[idx..idx + 3].copy_from_slice(&[255, 255, 255]);
+            }
+        }
+        let pre = Frame {
+            png: encode_png_rgb(&a, 400, 400).expect("encode"),
+            width: 400,
+            height: 400,
+        };
+        let post = Frame {
+            png: encode_png_rgb(&b, 400, 400).expect("encode"),
+            width: 400,
+            height: 400,
+        };
+        let win = window(400, 400);
+        let plain = Expectation::parse(&json!({"expect": {"changed": true}})).expect("expect");
+        let outcomes = evaluate_checks(&plain, &pre, &post, &win, (200, 200), None);
+        assert!(
+            !outcomes[0].passed,
+            "centre region must miss it: {outcomes:?}"
+        );
+        let anchored = Expectation::parse(
+            &json!({"expect": {"changed": true, "changed_around": {"x": 30, "y": 30}}}),
+        )
+        .expect("expect");
+        let outcomes = evaluate_checks(&anchored, &pre, &post, &win, (200, 200), None);
+        assert!(
+            outcomes[0].passed,
+            "anchored diff must see it: {outcomes:?}"
+        );
+        assert!(outcomes[0].detail.contains("anchored at 30,30"));
+        let full = Expectation::parse(&json!({"expect": {"changed": true, "full_frame": true}}))
+            .expect("expect");
+        let outcomes = evaluate_checks(&full, &pre, &post, &win, (200, 200), None);
+        // 60x60 of 400x400 = 2.25% > the 1% threshold.
+        assert!(
+            outcomes[0].passed,
+            "full-frame diff must see it: {outcomes:?}"
+        );
+        assert!(outcomes[0].detail.contains("full frame"));
+    }
+
+    #[test]
+    fn expectation_rejects_malformed_anchors() {
+        match Expectation::parse(&json!({"expect": {"changed": true, "changed_around": {"x": 1}}}))
+        {
+            Err(e) => assert_eq!(e.code, codes::BAD_ARGUMENTS),
+            Ok(x) => panic!("anchor without y accepted: {x:?}"),
+        }
+        match Expectation::parse(&json!({"expect": {"changed": true, "full_frame": "yes"}})) {
+            Err(e) => assert_eq!(e.code, codes::BAD_ARGUMENTS),
+            Ok(x) => panic!("non-boolean full_frame accepted: {x:?}"),
+        }
     }
 }

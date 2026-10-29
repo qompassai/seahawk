@@ -78,6 +78,12 @@ pub struct OpEntry {
     /// `verified` or `mismatch:<check>` (the first failed check).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verify: Option<String>,
+    /// Wiring (D-230): `code.feedback` summary — a compact JSON
+    /// string carrying route, checks, severity counts, file
+    /// hashes, and the episode iteration index. Message bodies
+    /// and formatted text are never logged (SPEC §3.3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feedback: Option<String>,
 }
 
 /// The S4 evidence fields of an op-log entry. All optional; the
@@ -96,6 +102,7 @@ pub struct LogExtra {
     pub ground_y: Option<i64>,
     pub ground_confidence: Option<f64>,
     pub verify: Option<String>,
+    pub feedback: Option<String>,
 }
 
 pub struct OpLog {
@@ -191,6 +198,7 @@ impl OpLog {
             ground_y: extra.ground_y,
             ground_confidence: extra.ground_confidence,
             verify: extra.verify,
+            feedback: extra.feedback,
         };
         let line = serde_json::to_string(&entry).unwrap_or_else(|_| "{}".to_string());
         let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());

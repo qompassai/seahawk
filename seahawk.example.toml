@@ -98,3 +98,37 @@ timeout_secs = 120
 [oplog]
 # Append-only JSONL op log (created if absent).
 path = "seahawk-oplog.jsonl"
+
+# ------------------------------------------------------------------
+# D-230 wiring (code.feedback) — OPT-IN, commented out as shipped.
+# Seahawk acts as a stdio MCP client of the estate's tooling
+# servers so brokered engine code changes get structured
+# feedback. Wiring is a deployment act: uncomment and point at
+# the real binaries on this machine.
+#
+# [[tooling]]
+# id = "theodolite"          # headless LSP diagnostics route
+# command = "/home/phaedrus/.local/bin/theodolite"
+# args = ["--config", "/home/phaedrus/.config/theodolite/bridge.toml"]
+# timeout_secs = 120
+# diagnostics_servers = { rs = "bacon-ls", lua = "lua-language-server", py = "basedpyright", cs = "roslyn", cpp = "clangd" }
+#
+# [[tooling]]
+# id = "periscope"           # diver format/lint pipelines route
+# command = "/home/phaedrus/.local/bin/periscope"
+# timeout_secs = 120
+#
+# [feedback]
+# max_files = 16
+# max_iterations_per_episode = 3
+# episode_window_secs = 600
+# project_roots = ["/home/phaedrus/projects/my-game"]
+#
+# Godot is registerable as a GUI app in the S4 pattern (its
+# language server is editor-hosted; GDScript feedback routes
+# through periscope while a Godot editor is up — SPEC R4):
+#
+# [[gui.apps]]
+# name = "godot"
+# display_name = "Godot"
+# window_match = ["Godot"]

@@ -23,13 +23,14 @@ use rmcp::model::{
 use rmcp::{ErrorData as McpError, RoleServer};
 use serde_json::{Map, Value, json};
 
-use crate::config::{Config, VisionRoute};
+use crate::config::{Config, ToolingId, VisionRoute};
 use crate::downstream::Downstream;
 use crate::gui::WindowInfo;
 use crate::gui::{ActuateOutcome, Capture, Frame, Gui, GuiError, ObserveOutcome};
 use crate::model::{GuiApp, Surface, ToolClass, ToolRecord};
 use crate::oplog::{LogExtra, OpLog};
 use crate::policy::{self, Decision, ToolKnowledge, codes, token_matches};
+use crate::tooling::{self, CheckKind, Route, ToolingPool};
 use crate::vision::{
     self, CheckOutcome, Expectation, FrameStore, GroundHit, Grounder, OllamaGrounder, RawGrounding,
     StoredFrame,
@@ -47,6 +48,32 @@ const NATIVE_OPLOG: &str = "seahawk_oplog";
 const VISION_OBSERVE: &str = "gui.observe";
 const VISION_GROUND: &str = "gui.ground";
 const VISION_ACT_VERIFIED: &str = "gui.act_verified";
+
+/// D-230 wiring: the one new broker tool. Read-class; the
+/// tooling client behind it is in the `tooling` module.
+const CODE_FEEDBACK: &str = "code.feedback";
+
+/// One `code.feedback` episode (SPEC §3.2): calls sharing a
+/// (workspace, file-set) key inside the configured window.
+/// The bound exists so a fix-and-recheck loop cannot grind
+/// through the broker; the 4th call is refused with the last
+/// result's counts and the episode closes.
+struct FeedbackEpisode {
+    window_start: Instant,
+    count: usize,
+    last_dirty: bool,
+    last_counts: String,
+}
+
+/// Mutable wiring state: feedback episodes + the periscope
+/// catalog snapshot (SPEC §3.2 / §1.4 — the snapshot is taken
+/// once per broker run, refreshed only at restart, and its
+/// provenance id rides in feedback results and the op log).
+#[derive(Default)]
+struct FeedbackState {
+    episodes: std::collections::HashMap<String, FeedbackEpisode>,
+    catalog: Option<(String, Value)>,
+}
 
 /// S5 vision state: the bounded frame store frames are referenced
 /// by, and the configured local grounder (None unless policy
@@ -199,6 +226,10 @@ pub struct SeahawkServer {
     /// Built once from policy at startup; registrations cannot
     /// change under a running server.
     gui_targets: Arc<std::collections::HashMap<String, (GuiApp, bool)>>,
+    /// D-230 wiring: the tooling clients (worker-thread owned).
+    tooling: Arc<ToolingPool>,
+    /// D-230 wiring: feedback episodes + catalog snapshot.
+    feedback_state: Arc<Mutex<FeedbackState>>,
 }
 
 impl SeahawkServer {
@@ -216,6 +247,7 @@ impl SeahawkServer {
             ))),
             VisionRoute::Agent | VisionRoute::None => None,
         };
+        let tooling = Arc::new(ToolingPool::from_config(&config.tooling));
         Self {
             config,
             downstream,
@@ -226,6 +258,8 @@ impl SeahawkServer {
                 grounder,
             }),
             gui_targets: Arc::new(gui_targets),
+            tooling,
+            feedback_state: Arc::new(Mutex::new(FeedbackState::default())),
         }
     }
 
@@ -311,7 +345,7 @@ impl SeahawkServer {
         );
         ground_props.insert(
             "agent_answer".to_string(),
-            json!({"type": "object", "description": "Your grounding answer for the agent route: the element's center in WINDOW-RELATIVE pixels of the referenced frame, plus your confidence.", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "confidence": {"type": "number"}}, "required": ["x", "y", "confidence"]}),
+            json!({"type": "object", "description": "Your grounding answer for the agent route: the element's center in WINDOW-RELATIVE pixels of the referenced frame, plus your confidence. Optional bbox {x_min, y_min, x_max, y_max} (window-relative pixels): when given, the broker acts on the bbox centre.", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "confidence": {"type": "number"}, "bbox": {"type": "object", "properties": {"x_min": {"type": "integer"}, "y_min": {"type": "integer"}, "x_max": {"type": "integer"}, "y_max": {"type": "integer"}}, "required": ["x_min", "y_min", "x_max", "y_max"]}}, "required": ["x", "y", "confidence"]}),
         );
         let mut ground_schema = Map::new();
         ground_schema.insert("type".to_string(), json!("object"));
@@ -371,11 +405,15 @@ impl SeahawkServer {
         );
         act_props.insert(
             "agent_answer".to_string(),
-            json!({"type": "object", "description": "Your grounding answer for the agent route: the element's center in window-relative pixels, plus confidence.", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "confidence": {"type": "number"}}, "required": ["x", "y", "confidence"]}),
+            json!({"type": "object", "description": "Your grounding answer for the agent route: the element's center in window-relative pixels, plus confidence. Optional bbox {x_min, y_min, x_max, y_max} (window-relative pixels): when given, the broker acts on the bbox centre.", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "confidence": {"type": "number"}, "bbox": {"type": "object", "properties": {"x_min": {"type": "integer"}, "y_min": {"type": "integer"}, "x_max": {"type": "integer"}, "y_max": {"type": "integer"}}, "required": ["x_min", "y_min", "x_max", "y_max"]}}, "required": ["x", "y", "confidence"]}),
+        );
+        act_props.insert(
+            "window_id".to_string(),
+            json!({"type": "integer", "description": "Optional window-identity pin (C4): an X window id from a prior gui.observe result. When given, the broker refuses with seahawk_gui_window_mismatch if the window that resolves at act time is a different one — never a silent re-match by title."}),
         );
         act_props.insert(
             "expect".to_string(),
-            json!({"type": "object", "description": "The expected effect, verified against a FRESH capture after acting. At least one machine check is required: changed (frame region around the point changed), title_contains (window title contains text), focused (app window holds focus), text_visible (text visibly present, needs the local grounder). description is free text for humans and the op log.", "properties": {"changed": {"type": "boolean"}, "title_contains": {"type": "string"}, "focused": {"type": "boolean"}, "text_visible": {"type": "string"}, "description": {"type": "string"}}}),
+            json!({"type": "object", "description": "The expected effect, verified against a FRESH capture after acting. At least one machine check is required: changed (frame region around the point changed), title_contains (window title contains text), focused (app window holds focus), text_visible (text visibly present, needs the local grounder). description is free text for humans and the op log.", "properties": {"changed": {"type": "boolean"}, "changed_around": {"type": "object", "description": "Anchor the changed diff on this window-relative point (for effects that appear away from the action point, e.g. menus).", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}}, "required": ["x", "y"]}, "full_frame": {"type": "boolean", "description": "Diff the whole frame for the changed check instead of a region around the point."}, "title_contains": {"type": "string"}, "focused": {"type": "boolean"}, "text_visible": {"type": "string"}, "description": {"type": "string"}}}),
         );
         let mut act_schema = Map::new();
         act_schema.insert("type".to_string(), json!("object"));
@@ -430,6 +468,50 @@ impl SeahawkServer {
                     .open_world(false),
             ),
         ]
+    }
+
+    /// The `code.feedback` tool definition (D-230 wiring,
+    /// SPEC §3.2). Read-class: diagnostics/lint/format only,
+    /// never a write — the dispatch table in `tooling.rs` is
+    /// the enforcement, this description is the contract.
+    fn feedback_tool() -> Tool {
+        let mut props = Map::new();
+        props.insert(
+            "workspace".to_string(),
+            json!({"type": "string", "description": "Absolute path of the engine project workspace. Must be inside a [feedback] project_roots entry in the broker's policy; anything else is refused."}),
+        );
+        props.insert(
+            "files".to_string(),
+            json!({"type": "array", "items": {"type": "string"}, "description": "Workspace-relative file paths to check (1..=16, per policy [feedback] max_files). Parent-escaping or absolute entries are refused."}),
+        );
+        props.insert(
+            "checks".to_string(),
+            json!({"type": "array", "items": {"type": "string", "enum": ["diagnostics", "lint", "format"]}, "description": "Which checks to run (default: all three). Diagnostics route to theodolite headless (GDScript: periscope); lint and format route to periscope's diver pipelines."}),
+        );
+        props.insert(
+            "route".to_string(),
+            json!({"type": "string", "enum": ["auto", "theodolite", "periscope"], "description": "Force a tooling route (default auto). A forced route that cannot serve a check is refused with seahawk_tooling_unavailable rather than silently rerouted."}),
+        );
+        props.insert(
+            "include_text".to_string(),
+            json!({"type": "boolean", "description": "Also return the formatter's text for files whose format check reports changed (bounded). Default false: format answers are changed booleans plus the steps that ran."}),
+        );
+        let mut schema = Map::new();
+        schema.insert("type".to_string(), json!("object"));
+        schema.insert("properties".to_string(), Value::Object(props));
+        schema.insert("required".to_string(), json!(["workspace", "files"]));
+        Tool::new(
+            CODE_FEEDBACK,
+            "Structured code feedback for brokered engine work (read-class, D-230):              per file, LSP diagnostics (theodolite headless route; GDScript via              periscope), lint verdicts and format changed flags (periscope running              diver's own pipelines), plus the file's sha256 and the catalog              provenance the answers came from. Bounded episodes: at most 3 calls              per (workspace, file set) per policy window — the 4th is refused              with seahawk_code_feedback_unresolved and the last counts, so change              strategy instead of grinding. A route that cannot serve a check              answers seahawk_tooling_unavailable; feedback is never assumed clean              and never writes anything.",
+            Arc::new(schema),
+        )
+        .with_annotations(
+            ToolAnnotations::new()
+                .read_only(true)
+                .destructive(false)
+                .idempotent(true)
+                .open_world(false),
+        )
     }
 
     fn brokered_tool(record: &ToolRecord) -> Tool {
@@ -520,6 +602,17 @@ impl SeahawkServer {
                 "grounder_ready": self.vision.grounder_ready(),
                 "min_confidence": self.config.vision.min_confidence,
                 "frames_stored": self.vision.lock_frames().len(),
+            },
+            "tooling": self.config.tooling.iter().map(|entry| json!({
+                "id": entry.id.as_str(),
+                "command": entry.command,
+            })).collect::<Vec<_>>(),
+            "feedback": {
+                "max_files": self.config.feedback.max_files,
+                "max_iterations_per_episode": self.config.feedback.max_iterations_per_episode,
+                "episode_window_secs": self.config.feedback.episode_window_secs,
+                "project_roots": self.config.feedback.project_roots.iter()
+                    .map(|root| root.display().to_string()).collect::<Vec<_>>(),
             },
             "class_overrides": self.config.class_overrides.len(),
             "oplog_path": self.oplog.path().display().to_string(),
@@ -907,6 +1000,14 @@ struct AttemptRecord {
     point: (i32, i32),
     confidence: Option<f64>,
     route: Option<&'static str>,
+    /// C1: the grounded element bounds for this attempt, when
+    /// the grounder supplied them.
+    bbox: Option<vision::PixelBBox>,
+    /// C4: the window this attempt resolved, recorded BEFORE
+    /// the action's effects are judged — a retarget (a spawned
+    /// render window, a focus change) is visible in the record.
+    window_id: u32,
+    window_title: String,
     pre_sha256: String,
     post_sha256: String,
     checks: Vec<CheckOutcome>,
@@ -919,6 +1020,9 @@ impl AttemptRecord {
             "point": {"x": self.point.0, "y": self.point.1},
             "confidence": self.confidence,
             "route": self.route,
+            "bbox": self.bbox.map(|bbox| bbox.to_json()),
+            "window_id": self.window_id,
+            "window_title": self.window_title,
             "pre_sha256": self.pre_sha256,
             "post_sha256": self.post_sha256,
             "checks": self.checks,
@@ -1154,8 +1258,11 @@ impl SeahawkServer {
             "how_to_answer": format!(
                 "Look at the attached frame and call {for_tool} again with the same \
                  arguments plus agent_answer {{\"x\": <window-relative pixel x>, \
-                 \"y\": <window-relative pixel y>, \"confidence\": <0..1>}} — the \
-                 center of the target element in the frame's pixel coordinates."
+                 \"y\": <window-relative pixel y>, \"confidence\": <0..1>, \
+                 \"bbox\": {{\"x_min\": <int>, \"y_min\": <int>, \"x_max\": <int>, \
+                 \"y_max\": <int>}} (optional)}} — the center of the target element \
+                 in the frame's pixel coordinates; when bbox is given, the broker \
+                 acts on its centre instead."
             ),
         });
         image_result(
@@ -1214,6 +1321,8 @@ impl SeahawkServer {
             "display_x": stored.window.x + hit.x,
             "display_y": stored.window.y + hit.y,
             "confidence": hit.confidence,
+            "bbox": hit.bbox.map(|bbox| bbox.to_json()),
+            "bbox_source": if hit.bbox.is_some() { "grounder" } else { "point_only" },
             "window": window_json(&stored.window),
             "display": stored.geometry.to_json(),
             "evidence_crop_sha256": crop_sha,
@@ -1264,11 +1373,18 @@ impl SeahawkServer {
         match joined {
             Ok(Ok(capture)) => {
                 let sha = self.store_capture(&app, &capture);
+                let content = match vision::frame_content(&capture.frame) {
+                    Ok(vision::FrameContent::SuspectBlank) => "suspect_blank",
+                    Ok(vision::FrameContent::Content) => "content",
+                    Err(_) => "content",
+                };
                 let payload = json!({
                     "app": app.name,
                     "frame_sha256": sha,
                     "width": capture.frame.width,
                     "height": capture.frame.height,
+                    "window_id": capture.window.id,
+                    "content": content,
                     "window": window_json(&capture.window),
                     "display": capture.geometry.to_json(),
                     "next": "pass frame_sha256 and a target description to gui.ground",
@@ -1385,8 +1501,8 @@ impl SeahawkServer {
                     self.ground_ticket(&stored, &target, VISION_GROUND)
                 }
                 Some(Err(error)) => self.refuse_logged(VISION_GROUND, Some("read"), &args, &error),
-                Some(Ok((x, y, confidence))) => {
-                    match vision::hit_from_agent_answer(&stored.frame, x, y, confidence) {
+                Some(Ok((x, y, confidence, bbox))) => {
+                    match vision::hit_from_agent_answer(&stored.frame, x, y, confidence, bbox) {
                         Ok(hit) => {
                             self.ground_hit_result(&args, &stored, &target, hit, "agent", started)
                         }
@@ -1591,6 +1707,23 @@ impl SeahawkServer {
                 };
             }
         }
+        let window_pin = match args.get("window_id") {
+            None => None,
+            Some(value) => match value.as_u64().and_then(|n| u32::try_from(n).ok()) {
+                Some(id) => Some(id),
+                None => {
+                    return self.refuse_logged(
+                        VISION_ACT_VERIFIED,
+                        Some("actuate"),
+                        &args,
+                        &GuiError::bad_arguments(
+                            "argument \"window_id\" must be a non-negative integer \
+                             (an X window id from a gui.observe result)",
+                        ),
+                    );
+                }
+            },
+        };
         let expect_description = expect.description.clone();
         let this = self.clone();
         let run_app = app.clone();
@@ -1603,6 +1736,7 @@ impl SeahawkServer {
                 target.as_deref(),
                 route,
                 agent_answer,
+                window_pin,
             )
         })
         .await;
@@ -1619,6 +1753,7 @@ impl SeahawkServer {
                     "action": args.get("action").and_then(Value::as_str),
                     "attempts": attempts.len(),
                     "point": last.map(|a| json!({"x": a.point.0, "y": a.point.1})),
+                    "bbox": last.and_then(|a| a.bbox).map(|bbox| bbox.to_json()),
                     "confidence": last.and_then(|a| a.confidence),
                     "route": last.and_then(|a| a.route),
                     "checks": last.map(|a| a.checks.clone()).unwrap_or_default(),
@@ -1691,12 +1826,83 @@ impl SeahawkServer {
         }
     }
 
+    /// Captures a frame that passes the C4 blank-frame screen:
+    /// a suspect-blank capture polls (up to 5 further captures
+    /// over ~10 s — an app still painting its first frame is the
+    /// ComfyUI-on-Xvfb shape) and only then refuses with
+    /// `seahawk_gui_suspect_blank`. A blank frame never verifies
+    /// anything and never grounds an act.
+    fn capture_contentful(&self, app: &GuiApp) -> Result<crate::gui::Capture, GuiError> {
+        let mut last_sha = String::new();
+        for poll in 0..=5 {
+            let capture = self.gui.capture(app)?;
+            last_sha = capture.frame.digest();
+            match vision::frame_content(&capture.frame) {
+                Ok(vision::FrameContent::Content) => return Ok(capture),
+                Ok(vision::FrameContent::SuspectBlank) => {
+                    if poll < 5 {
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(GuiError::new(
+            codes::GUI_SUSPECT_BLANK,
+            format!(
+                "frames of {} stayed suspect-blank (>99% one colour) through the                  content poll (last frame sha256 {last_sha}): the window is not                  presenting content, so nothing on it can be verified",
+                app.name
+            ),
+        ))
+    }
+
+    /// C2 crop escalation: ground `target` inside the evidence
+    /// crop around the previous attempt's point (a zoomed second
+    /// look), then map the hit back into frame coordinates.
+    fn ground_in_crop(
+        &self,
+        frame: &Frame,
+        target: &str,
+        prev: (i32, i32),
+    ) -> Result<GroundHit, GuiError> {
+        let crop = vision::evidence_crop(frame, prev.0, prev.1)?;
+        let x0 = (prev.0 - vision::EVIDENCE_CROP_HALF).clamp(0, frame.width as i32);
+        let y0 = (prev.1 - vision::EVIDENCE_CROP_HALF).clamp(0, frame.height as i32);
+        let raw = self.ground_locally_raw(&crop, target)?;
+        let inner = vision::hit_from_raw(raw, &crop);
+        Ok(GroundHit {
+            x: inner.x + x0,
+            y: inner.y + y0,
+            confidence: inner.confidence,
+            bbox: inner.bbox.map(|bbox| vision::PixelBBox {
+                x_min: bbox.x_min + x0,
+                y_min: bbox.y_min + y0,
+                x_max: bbox.x_max + x0,
+                y_max: bbox.y_max + y0,
+            }),
+        })
+    }
+
     /// The act-verified loop, blocking. Every completed attempt
     /// appends its own op-log entries (a `gui.ground` entry when
     /// the attempt grounded, then the `gui.act_verified` entry
     /// with bracket hashes, ground fields, and the verify
     /// outcome). decide() has already run in the handler — this
     /// loop is one authorized call, retries included.
+    ///
+    /// Curative round (C2/C3/C4): retries CHANGE STRATEGY —
+    /// attempt 2 re-grounds with the prior attempt's outcome in
+    /// the description, attempt 3 escalates (local: crop-zoom
+    /// grounding; agent: the local grounder where configured) —
+    /// and an identical re-ground is a strategy failure that
+    /// stops early instead of repeating an act that already
+    /// failed to verify. Every frame the loop judges passes the
+    /// blank-frame screen first, a caller `window_id` pin is
+    /// checked against the resolved window before acting, and a
+    /// point-less action's `changed` check diffs the full frame
+    /// (G-1: there is no region "around the point" when there is
+    /// no point; the S5 window-centre fallback verified nothing).
+    #[allow(clippy::too_many_arguments)]
     fn act_verified_run(
         &self,
         app: &GuiApp,
@@ -1704,7 +1910,8 @@ impl SeahawkServer {
         expect: &Expectation,
         target: Option<&str>,
         route: GroundRoute,
-        agent_answer: Option<(i64, i64, f64)>,
+        agent_answer: Option<AgentAnswer>,
+        window_pin: Option<u32>,
     ) -> ActVerifiedEnd {
         let grounder_ref: Option<&dyn Grounder> = self
             .vision
@@ -1712,71 +1919,169 @@ impl SeahawkServer {
             .as_deref()
             .map(|grounder| grounder as &dyn Grounder);
         let mut attempts: Vec<AttemptRecord> = Vec::new();
+        // The previous attempt's (point, first failed check) —
+        // the strategy loop's memory.
+        let mut prev: Option<((i32, i32), String)> = None;
         for attempt in 0..=vision::MAX_VERIFY_RETRIES {
             let attempt_started = Instant::now();
-            // --- Targeting: ground on a fresh capture, or take
+            // A raw-coordinate action is vocabulary-checked
+            // BEFORE any backend contact (the S4 ordering: an
+            // execute-shaped action dies in the vocabulary, not
+            // at the display). Grounded actions parse after
+            // grounding inserts the point, below.
+            if target.is_none()
+                && let Err(error) = crate::gui::parse_actuate(args)
+            {
+                return ActVerifiedEnd::Failed(error);
+            }
+            // --- C4: a contentful capture before anything is
+            // acted on; the window pin is checked against it.
+            let capture = match self.capture_contentful(app) {
+                Ok(capture) => capture,
+                Err(error) => return ActVerifiedEnd::Failed(error),
+            };
+            if let Some(pin) = window_pin
+                && capture.window.id != pin
+            {
+                return ActVerifiedEnd::Failed(GuiError::new(
+                    codes::GUI_WINDOW_MISMATCH,
+                    format!(
+                        "window_id pin {pin} does not match the window that                          resolves for {} now (id {} {:?}): refusing rather than                          silently re-matching by title",
+                        app.name, capture.window.id, capture.window.title
+                    ),
+                ));
+            }
+            // --- Targeting: ground on the fresh capture, or take
             // the caller's raw point from the action's own fields.
             let mut act_args = args.clone();
-            let (ground_point, confidence, route_label) = match target {
+            let (ground_point, confidence, route_label, ground_bbox) = match target {
                 Some(target_text) => {
-                    let capture = match self.gui.capture(app) {
-                        Ok(capture) => capture,
-                        Err(error) => return ActVerifiedEnd::Failed(error),
-                    };
                     let frame_sha = self.store_capture(app, &capture);
-                    let hit = match route {
-                        GroundRoute::Agent => {
-                            // The handler only reaches the loop
-                            // with an answer in hand for this route.
-                            let Some((ax, ay, ac)) = agent_answer else {
-                                return ActVerifiedEnd::Failed(GuiError::new(
-                                    codes::GUI_GROUNDER_UNAVAILABLE,
-                                    "agent-route grounding inside gui.act_verified \
-                                     requires agent_answer in the call",
-                                ));
-                            };
-                            match vision::hit_from_agent_answer(&capture.frame, ax, ay, ac) {
-                                Ok(hit) => hit,
-                                Err(error) => return ActVerifiedEnd::Failed(error),
-                            }
+                    // C2: the description this attempt grounds
+                    // with — refined by the prior outcome from
+                    // attempt 2 on.
+                    let refined = prev.as_ref().map(|((px, py), check)| {
+                        format!(
+                            "{target_text} — a previous attempt grounded at {px},{py}                              but the expected effect was not observed (failed check:                              {check}); locate the element precisely by its visible                              label and its full widget bounds"
+                        )
+                    });
+                    let ground_desc: &str = refined.as_deref().unwrap_or(target_text);
+                    let (hit, route_label) = if attempt == vision::MAX_VERIFY_RETRIES
+                        && route == GroundRoute::Local
+                        && prev.is_some()
+                    {
+                        // Final attempt, local route: escalate to
+                        // a crop-zoom ground around the prior point.
+                        match self.ground_in_crop(
+                            &capture.frame,
+                            ground_desc,
+                            prev.as_ref().map(|(point, _)| *point).unwrap_or((0, 0)),
+                        ) {
+                            Ok(hit) => (hit, "local-crop"),
+                            Err(error) => return ActVerifiedEnd::Failed(error),
                         }
-                        GroundRoute::Local => {
-                            let raw = match self.ground_locally_raw(&capture.frame, target_text) {
-                                Ok(raw) => raw,
-                                Err(error) => return ActVerifiedEnd::Failed(error),
-                            };
-                            let hit = vision::hit_from_raw(raw, &capture.frame);
-                            if hit.confidence < self.config.vision.min_confidence {
-                                self.oplog.record_with(
-                                    VISION_GROUND,
-                                    Some("read"),
-                                    Some(args),
-                                    "error",
-                                    None,
-                                    Some("grounder confidence below the configured floor"),
-                                    LogExtra {
-                                        frame_sha256: Some(frame_sha),
-                                        frame_width: Some(capture.frame.width),
-                                        frame_height: Some(capture.frame.height),
-                                        ground_x: Some(i64::from(hit.x)),
-                                        ground_y: Some(i64::from(hit.y)),
-                                        ground_confidence: Some(hit.confidence),
-                                        target: Some(target_text.to_string()),
-                                        ..Default::default()
-                                    },
-                                );
-                                return ActVerifiedEnd::Failed(GuiError::new(
-                                    codes::GUI_GROUND_FAILED,
-                                    format!(
-                                        "grounder confidence {:.2} for {target_text:?} \
-                                         is below the configured floor {:.2}",
-                                        hit.confidence, self.config.vision.min_confidence
-                                    ),
-                                ));
+                    } else if attempt == vision::MAX_VERIFY_RETRIES
+                        && route == GroundRoute::Agent
+                        && self.vision.grounder.is_some()
+                    {
+                        // Final attempt, agent route with a local
+                        // grounder configured: escalate routes.
+                        let raw = match self.ground_locally_raw(&capture.frame, ground_desc) {
+                            Ok(raw) => raw,
+                            Err(error) => return ActVerifiedEnd::Failed(error),
+                        };
+                        (
+                            vision::hit_from_raw(raw, &capture.frame),
+                            "ollama-escalated",
+                        )
+                    } else {
+                        match route {
+                            GroundRoute::Agent => {
+                                // The handler only reaches the loop
+                                // with an answer in hand for this route.
+                                let Some((ax, ay, ac, abbox)) = agent_answer else {
+                                    return ActVerifiedEnd::Failed(GuiError::new(
+                                        codes::GUI_GROUNDER_UNAVAILABLE,
+                                        "agent-route grounding inside gui.act_verified \
+                                         requires agent_answer in the call",
+                                    ));
+                                };
+                                match vision::hit_from_agent_answer(
+                                    &capture.frame,
+                                    ax,
+                                    ay,
+                                    ac,
+                                    abbox,
+                                ) {
+                                    Ok(hit) => (hit, route.label()),
+                                    Err(error) => return ActVerifiedEnd::Failed(error),
+                                }
                             }
-                            hit
+                            GroundRoute::Local => {
+                                let raw = match self.ground_locally_raw(&capture.frame, ground_desc)
+                                {
+                                    Ok(raw) => raw,
+                                    Err(error) => return ActVerifiedEnd::Failed(error),
+                                };
+                                (vision::hit_from_raw(raw, &capture.frame), route.label())
+                            }
                         }
                     };
+                    if hit.confidence < self.config.vision.min_confidence {
+                        self.oplog.record_with(
+                            VISION_GROUND,
+                            Some("read"),
+                            Some(args),
+                            "error",
+                            None,
+                            Some("grounder confidence below the configured floor"),
+                            LogExtra {
+                                frame_sha256: Some(frame_sha),
+                                frame_width: Some(capture.frame.width),
+                                frame_height: Some(capture.frame.height),
+                                ground_x: Some(i64::from(hit.x)),
+                                ground_y: Some(i64::from(hit.y)),
+                                ground_confidence: Some(hit.confidence),
+                                target: Some(target_text.to_string()),
+                                ..Default::default()
+                            },
+                        );
+                        return ActVerifiedEnd::Failed(GuiError::new(
+                            codes::GUI_GROUND_FAILED,
+                            format!(
+                                "grounder confidence {:.2} for {target_text:?} \
+                                 is below the configured floor {:.2} (bbox {:?})",
+                                hit.confidence,
+                                self.config.vision.min_confidence,
+                                hit.bbox.map(|bbox| bbox.to_json())
+                            ),
+                        ));
+                    }
+                    // C2: an identical re-ground after a failed
+                    // attempt is a strategy failure — stop early
+                    // rather than repeat the same act.
+                    if let Some(((px, py), _)) = prev
+                        && (hit.x - px).abs() <= 2
+                        && (hit.y - py).abs() <= 2
+                    {
+                        self.oplog.record_with(
+                            VISION_ACT_VERIFIED,
+                            Some("actuate"),
+                            Some(args),
+                            "error",
+                            Some(elapsed_ms(attempt_started)),
+                            Some("correction re-grounded the identical point; strategy failure"),
+                            LogExtra {
+                                ground_x: Some(i64::from(hit.x)),
+                                ground_y: Some(i64::from(hit.y)),
+                                ground_confidence: Some(hit.confidence),
+                                target: Some(target_text.to_string()),
+                                verify: Some("mismatch:strategy".to_string()),
+                                ..Default::default()
+                            },
+                        );
+                        return ActVerifiedEnd::Mismatch { attempts };
+                    }
                     self.oplog.record_with(
                         VISION_GROUND,
                         Some("read"),
@@ -1802,10 +2107,11 @@ impl SeahawkServer {
                     (
                         Some((hit.x, hit.y)),
                         Some(hit.confidence),
-                        Some(route.label()),
+                        Some(route_label),
+                        hit.bbox,
                     )
                 }
-                None => (None, None, None),
+                None => (None, None, None, None),
             };
             // --- Act (through the S4 surface: parse, confine,
             // bracket — unchanged).
@@ -1817,10 +2123,21 @@ impl SeahawkServer {
                 Ok(outcome) => outcome,
                 Err(error) => return ActVerifiedEnd::Failed(error),
             };
-            // --- Verify against a fresh capture.
-            let post_capture = match self.gui.capture(app) {
+            // --- Verify against a fresh, content-screened capture.
+            let post_capture = match self.capture_contentful(app) {
                 Ok(capture) => capture,
                 Err(error) => {
+                    if error.code == codes::GUI_SUSPECT_BLANK {
+                        return ActVerifiedEnd::Failed(GuiError::new(
+                            codes::GUI_SUSPECT_BLANK,
+                            format!(
+                                "the action was performed on {} but the post-action \
+                                 frame stayed suspect-blank, so the effect cannot be \
+                                 verified: {}",
+                                app.name, error.message
+                            ),
+                        ));
+                    }
                     return ActVerifiedEnd::Failed(GuiError::new(
                         codes::GUI_ACTION_FAILED,
                         format!(
@@ -1842,8 +2159,20 @@ impl SeahawkServer {
                     i32::try_from(outcome.pre.width / 2).unwrap_or(0),
                     i32::try_from(outcome.pre.height / 2).unwrap_or(0),
                 ));
+            // C3/G-1: a point-less action (a key press) has no
+            // region to centre on; its `changed` check diffs the
+            // full frame unless the caller anchored it.
+            let mut effective_expect = expect.clone();
+            if effective_expect.changed.is_some()
+                && effective_expect.changed_around.is_none()
+                && !effective_expect.full_frame
+                && ground_point.is_none()
+                && action.points().is_empty()
+            {
+                effective_expect.full_frame = true;
+            }
             let checks = vision::evaluate_checks(
-                expect,
+                &effective_expect,
                 &outcome.pre,
                 &diff_frame,
                 &post_capture.window,
@@ -1886,6 +2215,9 @@ impl SeahawkServer {
                 point: verify_point,
                 confidence,
                 route: route_label,
+                bbox: ground_bbox,
+                window_id: post_capture.window.id,
+                window_title: post_capture.window.title.clone(),
                 pre_sha256: outcome.pre.digest(),
                 post_sha256: post_sha,
                 checks,
@@ -1897,9 +2229,724 @@ impl SeahawkServer {
                     window: post_capture.window,
                 };
             }
+            prev = Some((verify_point, first_failed.unwrap_or("unknown").to_string()));
         }
         ActVerifiedEnd::Mismatch { attempts }
     }
+
+    /// `code.feedback` (D-230 wiring): async shell — the work
+    /// blocks on tooling stdio, so it runs on a blocking thread.
+    async fn code_feedback(&self, args: Value) -> CallToolResult {
+        let this = self.clone();
+        let run_args = args.clone();
+        let joined = tokio::task::spawn_blocking(move || this.code_feedback_run(&run_args)).await;
+        match joined {
+            Ok(result) => result,
+            Err(join) => self.error_logged(
+                CODE_FEEDBACK,
+                Some("read"),
+                &args,
+                None,
+                &GuiError::failed(format!("feedback task failed: {join}")),
+            ),
+        }
+    }
+
+    /// The blocking feedback run: parse + workspace gate,
+    /// episode bound, catalog snapshot, per-file checks over
+    /// the tooling routes, staleness re-check, op-log summary.
+    /// Every refusal is typed; an unserved check is reported
+    /// per file, and a call where NOTHING could be served is a
+    /// `seahawk_tooling_unavailable` refusal — feedback never
+    /// reports an assumed-clean result (SPEC §5).
+    fn code_feedback_run(&self, args: &Value) -> CallToolResult {
+        let started = Instant::now();
+        // ---- Parse -------------------------------------------------
+        let Some(workspace_raw) = args.get("workspace").and_then(Value::as_str) else {
+            return self.refuse_logged(
+                CODE_FEEDBACK,
+                Some("read"),
+                args,
+                &GuiError::bad_arguments("argument \"workspace\" is required (absolute path)"),
+            );
+        };
+        let workspace_path = std::path::PathBuf::from(workspace_raw);
+        let Ok(workspace) = workspace_path.canonicalize() else {
+            return self.refuse_logged(
+                CODE_FEEDBACK,
+                Some("read"),
+                args,
+                &GuiError::bad_arguments(format!(
+                    "workspace {workspace_raw:?} does not exist or cannot be resolved"
+                )),
+            );
+        };
+        let roots: Vec<std::path::PathBuf> = self
+            .config
+            .feedback
+            .project_roots
+            .iter()
+            .filter_map(|root| root.canonicalize().ok())
+            .collect();
+        if !roots.iter().any(|root| workspace.starts_with(root)) {
+            return self.refuse_logged(
+                CODE_FEEDBACK,
+                Some("read"),
+                args,
+                &GuiError::bad_arguments(format!(
+                    "workspace {} is not inside a registered engine project root \
+                     ([feedback] project_roots in policy): feedback serves \
+                     registered workspaces only",
+                    workspace.display()
+                )),
+            );
+        }
+        let Some(files_value) = args.get("files").and_then(Value::as_array) else {
+            return self.refuse_logged(
+                CODE_FEEDBACK,
+                Some("read"),
+                args,
+                &GuiError::bad_arguments(
+                    "argument \"files\" is required (an array of workspace-relative paths)",
+                ),
+            );
+        };
+        if files_value.is_empty() || files_value.len() > self.config.feedback.max_files {
+            return self.refuse_logged(
+                CODE_FEEDBACK,
+                Some("read"),
+                args,
+                &GuiError::bad_arguments(format!(
+                    "argument \"files\" must name 1..={} files",
+                    self.config.feedback.max_files
+                )),
+            );
+        }
+        let mut files: Vec<String> = Vec::with_capacity(files_value.len());
+        for entry in files_value {
+            let Some(rel) = entry.as_str() else {
+                return self.refuse_logged(
+                    CODE_FEEDBACK,
+                    Some("read"),
+                    args,
+                    &GuiError::bad_arguments("\"files\" entries must be strings"),
+                );
+            };
+            let rel_path = std::path::Path::new(rel);
+            let escapes = rel_path.is_absolute()
+                || rel_path
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir));
+            if escapes {
+                return self.refuse_logged(
+                    CODE_FEEDBACK,
+                    Some("read"),
+                    args,
+                    &GuiError::bad_arguments(format!(
+                        "file {rel:?} is absolute or escapes the workspace: \
+                         files are workspace-relative paths"
+                    )),
+                );
+            }
+            if !workspace.join(rel_path).is_file() {
+                return self.refuse_logged(
+                    CODE_FEEDBACK,
+                    Some("read"),
+                    args,
+                    &GuiError::bad_arguments(format!(
+                        "file {rel:?} does not exist inside the workspace"
+                    )),
+                );
+            }
+            files.push(rel.to_string());
+        }
+        let mut checks: Vec<CheckKind> = Vec::new();
+        match args.get("checks") {
+            None => checks.extend([CheckKind::Diagnostics, CheckKind::Lint, CheckKind::Format]),
+            Some(Value::Array(items)) => {
+                for item in items {
+                    let Some(name) = item.as_str() else {
+                        return self.refuse_logged(
+                            CODE_FEEDBACK,
+                            Some("read"),
+                            args,
+                            &GuiError::bad_arguments("\"checks\" entries must be strings"),
+                        );
+                    };
+                    let Some(kind) = CheckKind::parse(name) else {
+                        return self.refuse_logged(
+                            CODE_FEEDBACK,
+                            Some("read"),
+                            args,
+                            &GuiError::bad_arguments(format!(
+                                "unknown check {name:?}: diagnostics | lint | format"
+                            )),
+                        );
+                    };
+                    if !checks.contains(&kind) {
+                        checks.push(kind);
+                    }
+                }
+                if checks.is_empty() {
+                    return self.refuse_logged(
+                        CODE_FEEDBACK,
+                        Some("read"),
+                        args,
+                        &GuiError::bad_arguments("\"checks\" must name at least one check"),
+                    );
+                }
+            }
+            Some(_) => {
+                return self.refuse_logged(
+                    CODE_FEEDBACK,
+                    Some("read"),
+                    args,
+                    &GuiError::bad_arguments("\"checks\" must be an array"),
+                );
+            }
+        }
+        let forced: Option<Route> = match args.get("route").and_then(Value::as_str) {
+            None | Some("auto") => None,
+            Some("theodolite") => Some(Route::Theodolite),
+            Some("periscope") => Some(Route::Periscope),
+            Some(other) => {
+                return self.refuse_logged(
+                    CODE_FEEDBACK,
+                    Some("read"),
+                    args,
+                    &GuiError::bad_arguments(format!(
+                        "argument \"route\" must be auto | theodolite | periscope (got {other:?})"
+                    )),
+                );
+            }
+        };
+        let include_text = args
+            .get("include_text")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        // ---- Episode bound (SPEC §3.2) ------------------------------
+        let episode_key = crate::oplog::args_digest(&json!({
+            "workspace": workspace.display().to_string(),
+            "files": files,
+        }));
+        let max_iterations = self.config.feedback.max_iterations_per_episode;
+        let window = std::time::Duration::from_secs(self.config.feedback.episode_window_secs);
+        let iteration = {
+            let mut state = self
+                .feedback_state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let episode = state
+                .episodes
+                .entry(episode_key.clone())
+                .or_insert_with(|| FeedbackEpisode {
+                    window_start: Instant::now(),
+                    count: 0,
+                    last_dirty: false,
+                    last_counts: String::new(),
+                });
+            if episode.window_start.elapsed() > window {
+                episode.window_start = Instant::now();
+                episode.count = 0;
+            }
+            episode.count += 1;
+            if episode.count > max_iterations {
+                let message = format!(
+                    "feedback episode bound reached: {max_iterations} calls for this \
+                     workspace + file set inside the window and the last result was \
+                     still dirty ({}); the episode is closed — change strategy \
+                     (a different fix, a human, or the Owner) rather than grinding",
+                    episode.last_counts
+                );
+                drop(state);
+                return self.refuse_logged(
+                    CODE_FEEDBACK,
+                    Some("read"),
+                    args,
+                    &GuiError::new(codes::FEEDBACK_UNRESOLVED, message),
+                );
+            }
+            episode.count
+        };
+
+        // ---- Catalog snapshot (once per broker run) -----------------
+        let catalog = self.catalog_snapshot();
+
+        // ---- Check passes with a staleness re-check -----------------
+        let hashes_before = hash_files(&workspace, &files);
+        let mut outcome = self.feedback_pass(&workspace, &files, &checks, forced, include_text);
+        let hashes_after = hash_files(&workspace, &files);
+        if hashes_after != hashes_before {
+            // A file changed while it was being checked: re-run
+            // once against the new bytes; still moving → stale.
+            outcome = self.feedback_pass(&workspace, &files, &checks, forced, include_text);
+            let hashes_final = hash_files(&workspace, &files);
+            if hashes_final != hashes_after {
+                return self.refuse_logged(
+                    CODE_FEEDBACK,
+                    Some("read"),
+                    args,
+                    &GuiError::new(
+                        codes::FEEDBACK_STALE,
+                        "files changed on disk again while feedback was re-checked: \
+                         the result would describe bytes that no longer exist in \
+                         that form (seahawk_feedback_stale)",
+                    ),
+                );
+            }
+            outcome.stale_suspect = true;
+        }
+
+        if !outcome.any_served {
+            let reason = outcome
+                .first_unavailable_reason
+                .clone()
+                .unwrap_or_else(|| "no tooling route served any check".to_string());
+            return self.refuse_logged(
+                CODE_FEEDBACK,
+                Some("read"),
+                args,
+                &GuiError::new(
+                    codes::TOOLING_UNAVAILABLE,
+                    format!(
+                        "code.feedback could not serve any check: {reason}. \
+                         Feedback reports unavailable, never an assumed-clean result"
+                    ),
+                ),
+            );
+        }
+
+        let counts = json!({
+            "errors": outcome.errors,
+            "warnings": outcome.warnings,
+            "lint_diagnostics": outcome.lint_diagnostics,
+            "format_changed": outcome.format_changed,
+        });
+        let dirty = outcome.errors + outcome.warnings + outcome.lint_diagnostics > 0
+            || outcome.format_changed > 0;
+        {
+            let mut state = self
+                .feedback_state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(episode) = state.episodes.get_mut(&episode_key) {
+                episode.last_dirty = dirty;
+                episode.last_counts = counts.to_string();
+            }
+        }
+        let summary = json!({
+            "checks": checks.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+            "counts": counts,
+            "iteration": iteration,
+            "routes": outcome.routes_used,
+            "stale_suspect": outcome.stale_suspect,
+        });
+        self.oplog.record_with(
+            CODE_FEEDBACK,
+            Some("read"),
+            Some(args),
+            "ok",
+            Some(elapsed_ms(started)),
+            None,
+            LogExtra {
+                feedback: Some(summary.to_string()),
+                ..Default::default()
+            },
+        );
+        let payload = json!({
+            "workspace": workspace.display().to_string(),
+            "iteration": iteration,
+            "max_iterations": max_iterations,
+            "dirty": dirty,
+            "counts": counts,
+            "stale_suspect": outcome.stale_suspect,
+            "catalog": catalog,
+            "files": outcome.files,
+        });
+        json_result(&payload)
+    }
+
+    /// The periscope catalog snapshot (SPEC §1.4): taken once,
+    /// on the first feedback call that can reach periscope;
+    /// provenance is the sha256 of the canonical snapshot. A
+    /// failed snapshot is reported in the result, never faked.
+    fn catalog_snapshot(&self) -> Value {
+        {
+            let state = self
+                .feedback_state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some((provenance, counts)) = &state.catalog {
+                return json!({"provenance": provenance, "counts": counts});
+            }
+        }
+        let Some(client) = self.tooling.get(ToolingId::Periscope) else {
+            return json!(null);
+        };
+        let mut snapshot = serde_json::Map::new();
+        for tool in [
+            "list_servers",
+            "list_formatters",
+            "list_linters",
+            "broker_status",
+        ] {
+            match client.call(tool, json!({})) {
+                Ok(value) => {
+                    snapshot.insert(tool.to_string(), value);
+                }
+                Err(error) => {
+                    return json!({"unavailable": error.message});
+                }
+            }
+        }
+        let snapshot = Value::Object(snapshot);
+        let provenance = crate::oplog::args_digest(&snapshot);
+        let counts = json!({
+            "servers": array_len_any(&snapshot, &["servers", "tools"]),
+            "formatters": array_len_any(&snapshot, &["formatters"]),
+            "linters": array_len_any(&snapshot, &["linters"]),
+        });
+        let mut state = self
+            .feedback_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        state.catalog = Some((provenance.clone(), counts.clone()));
+        json!({"provenance": provenance, "counts": counts})
+    }
+
+    /// One full pass of checks over the file set.
+    fn feedback_pass(
+        &self,
+        workspace: &std::path::Path,
+        files: &[String],
+        checks: &[CheckKind],
+        forced: Option<Route>,
+        include_text: bool,
+    ) -> FeedbackPass {
+        let have_theodolite = self.tooling.has(ToolingId::Theodolite);
+        let have_periscope = self.tooling.has(ToolingId::Periscope);
+        let mut pass = FeedbackPass::default();
+        for rel in files {
+            let abs = workspace.join(rel);
+            let abs_str = abs.display().to_string();
+            let ext = abs
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            let sha = std::fs::read(&abs)
+                .map(|bytes| crate::oplog::bytes_digest(&bytes))
+                .unwrap_or_default();
+            let mut file_json = json!({"path": rel, "file_sha256": sha});
+            for check in checks {
+                let route =
+                    match tooling::route_for(*check, forced, &ext, have_theodolite, have_periscope)
+                    {
+                        Ok(route) => route,
+                        Err(reason) => {
+                            pass.note_unavailable(&reason);
+                            file_json[check.as_str()] =
+                                json!({"status": "unavailable", "reason": reason});
+                            continue;
+                        }
+                    };
+                pass.routes_used
+                    .insert(format!("{}:{}", check.as_str(), route.as_str()));
+                let Some(client) = self.tooling.get(route.id()) else {
+                    let reason = format!("{} is not configured", route.as_str());
+                    pass.note_unavailable(&reason);
+                    file_json[check.as_str()] = json!({"status": "unavailable", "reason": reason});
+                    continue;
+                };
+                match (check, route) {
+                    (CheckKind::Diagnostics, Route::Theodolite) => {
+                        let server = self
+                            .config
+                            .tooling_entry(ToolingId::Theodolite)
+                            .and_then(|entry| entry.diagnostics_servers.get(&ext))
+                            .cloned();
+                        let Some(server) = server else {
+                            let reason = format!(
+                                "no theodolite server is pinned for extension {ext:?} \
+                                 ([[tooling]] diagnostics_servers): the pin mirrors \
+                                 diver's lsp choice for the language (SPEC REQ-8)"
+                            );
+                            pass.note_unavailable(&reason);
+                            file_json["diagnostics"] =
+                                json!({"status": "unavailable", "reason": reason});
+                            continue;
+                        };
+                        match client.call(
+                            "diagnostics",
+                            json!({"workspace": workspace.display().to_string(), "server": server, "path": rel}),
+                        ) {
+                            Ok(result) => {
+                                let mapped = map_diagnostics(&result, Some(&server));
+                                pass.errors += mapped.1;
+                                pass.warnings += mapped.2;
+                                pass.any_served = true;
+                                file_json["diagnostics"] = mapped.0;
+                            }
+                            Err(error) => {
+                                pass.note_unavailable(&error.message);
+                                file_json["diagnostics"] = json!({
+                                    "status": "unavailable", "code": error.code,
+                                    "reason": error.message,
+                                });
+                            }
+                        }
+                    }
+                    (CheckKind::Diagnostics, Route::Periscope) => {
+                        match client.call("get_diagnostics", json!({"path": abs_str})) {
+                            Ok(result) => {
+                                let mapped = map_diagnostics(&result, None);
+                                pass.errors += mapped.1;
+                                pass.warnings += mapped.2;
+                                pass.any_served = true;
+                                file_json["diagnostics"] = mapped.0;
+                            }
+                            Err(error) => {
+                                pass.note_unavailable(&error.message);
+                                file_json["diagnostics"] = json!({
+                                    "status": "unavailable", "code": error.code,
+                                    "reason": error.message,
+                                });
+                            }
+                        }
+                    }
+                    (CheckKind::Lint, _) => match client.call("run_lint", json!({"path": abs_str}))
+                    {
+                        Ok(result) => {
+                            let (lint_json, diagnostics) = map_lint(&result);
+                            pass.lint_diagnostics += diagnostics;
+                            pass.any_served = true;
+                            file_json["lint"] = lint_json;
+                        }
+                        Err(error) => {
+                            pass.note_unavailable(&error.message);
+                            file_json["lint"] = json!({
+                                "status": "unavailable", "code": error.code,
+                                "reason": error.message,
+                            });
+                        }
+                    },
+                    (CheckKind::Format, _) => {
+                        match client.call("run_format", json!({"path": abs_str})) {
+                            Ok(result) => {
+                                let changed = result
+                                    .get("changed")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false);
+                                if changed {
+                                    pass.format_changed += 1;
+                                }
+                                pass.any_served = true;
+                                let mut format_json = json!({
+                                    "changed": changed,
+                                    "steps": result.get("steps").cloned().unwrap_or(json!([])),
+                                    "written": false,
+                                });
+                                if include_text
+                                    && changed
+                                    && let Some(text) = result.get("text").and_then(Value::as_str)
+                                {
+                                    format_json["text"] = json!(truncate_chars(text, 4000));
+                                }
+                                file_json["format"] = format_json;
+                            }
+                            Err(error) => {
+                                pass.note_unavailable(&error.message);
+                                file_json["format"] = json!({
+                                    "status": "unavailable", "code": error.code,
+                                    "reason": error.message,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            pass.files.push(file_json);
+        }
+        pass
+    }
+}
+
+/// The accumulated result of one `code.feedback` pass.
+#[derive(Default)]
+struct FeedbackPass {
+    files: Vec<Value>,
+    errors: usize,
+    warnings: usize,
+    lint_diagnostics: usize,
+    format_changed: usize,
+    any_served: bool,
+    stale_suspect: bool,
+    routes_used: std::collections::BTreeSet<String>,
+    first_unavailable_reason: Option<String>,
+}
+
+impl FeedbackPass {
+    fn note_unavailable(&mut self, reason: &str) {
+        if self.first_unavailable_reason.is_none() {
+            self.first_unavailable_reason = Some(reason.to_string());
+        }
+    }
+}
+
+/// sha256 of each file's current bytes, keyed by relative path.
+fn hash_files(
+    workspace: &std::path::Path,
+    files: &[String],
+) -> std::collections::HashMap<String, String> {
+    files
+        .iter()
+        .map(|rel| {
+            let digest = std::fs::read(workspace.join(rel))
+                .map(|bytes| crate::oplog::bytes_digest(&bytes))
+                .unwrap_or_default();
+            (rel.clone(), digest)
+        })
+        .collect()
+}
+
+/// Truncates to at most `max` characters (char-boundary safe).
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max).collect();
+    out.push_str("…[truncated]");
+    out
+}
+
+/// Normalizes a diagnostic severity (LSP number 1..=4, or a
+/// string label from either tooling server) to a label.
+fn severity_label(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::Number(number)) => match number.as_i64() {
+            Some(1) => "error".to_string(),
+            Some(2) => "warning".to_string(),
+            Some(3) => "information".to_string(),
+            Some(4) => "hint".to_string(),
+            _ => "unknown".to_string(),
+        },
+        Some(Value::String(text)) => text.to_lowercase(),
+        _ => "unknown".to_string(),
+    }
+}
+
+/// Maps a tooling diagnostics result (theodolite's shape, or
+/// periscope's buffer-diagnostics shape) into the feedback
+/// per-file form: bounded item list (first 20) + honest total +
+/// error/warning counts. Returns (json, errors, warnings).
+fn map_diagnostics(result: &Value, pinned_server: Option<&str>) -> (Value, usize, usize) {
+    let items = result
+        .get("diagnostics")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let total = result
+        .get("count")
+        .and_then(Value::as_u64)
+        .map(|count| count as usize)
+        .unwrap_or(items.len());
+    let mut errors = 0usize;
+    let mut warnings = 0usize;
+    let mut mapped: Vec<Value> = Vec::new();
+    for item in &items {
+        let severity = severity_label(item.get("severity"));
+        match severity.as_str() {
+            "error" => errors += 1,
+            "warning" => warnings += 1,
+            _ => {}
+        }
+        if mapped.len() < 20 {
+            mapped.push(json!({
+                "severity": severity,
+                "source": item.get("source").and_then(Value::as_str).unwrap_or(""),
+                "message": truncate_chars(
+                    item.get("message").and_then(Value::as_str).unwrap_or(""), 300),
+                "range": item.get("range").cloned().unwrap_or(Value::Null),
+                "path": item.get("uri").and_then(Value::as_str)
+                    .or_else(|| item.get("path").and_then(Value::as_str)).unwrap_or(""),
+            }));
+        }
+    }
+    let server = result
+        .get("server")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| pinned_server.map(str::to_string));
+    (
+        json!({
+            "status": "ok",
+            "server": server,
+            "count": total,
+            "overflow": total.saturating_sub(mapped.len()),
+            "diagnostics": mapped,
+        }),
+        errors,
+        warnings,
+    )
+}
+
+/// Maps a periscope `run_lint` result into the feedback form:
+/// per-linter status + diagnostic counts.
+fn map_lint(result: &Value) -> (Value, usize) {
+    if let Some(linters) = result.get("linters").and_then(Value::as_array) {
+        let mut total = 0usize;
+        let mapped: Vec<Value> = linters
+            .iter()
+            .map(|linter| {
+                let diagnostics = linter
+                    .get("diagnostics")
+                    .and_then(Value::as_array)
+                    .map(|items| items.len())
+                    .unwrap_or(0);
+                total += diagnostics;
+                json!({
+                    "name": linter.get("name").and_then(Value::as_str)
+                        .or_else(|| linter.get("linter").and_then(Value::as_str)).unwrap_or(""),
+                    "status": linter.get("status").and_then(Value::as_str).unwrap_or(""),
+                    "diagnostics": diagnostics,
+                })
+            })
+            .collect();
+        return (json!({"status": "ok", "linters": mapped}), total);
+    }
+    let diagnostics = result
+        .get("diagnostics")
+        .and_then(Value::as_array)
+        .map(|items| items.len())
+        .unwrap_or(0);
+    (
+        json!({
+            "status": result.get("status").and_then(Value::as_str).unwrap_or("ok"),
+            "linters": [],
+            "diagnostics": diagnostics,
+        }),
+        diagnostics,
+    )
+}
+
+/// The length of the first array found under any of `keys` in
+/// any of the snapshot's tool results (catalog counts are
+/// defensive: server payload shapes vary by tool).
+fn array_len_any(snapshot: &Value, keys: &[&str]) -> Value {
+    if let Some(object) = snapshot.as_object() {
+        for result in object.values() {
+            for key in keys {
+                if let Some(array) = result.get(key).and_then(Value::as_array) {
+                    return json!(array.len());
+                }
+            }
+            if let Some(array) = result.as_array() {
+                return json!(array.len());
+            }
+        }
+    }
+    Value::Null
 }
 
 /// Parses the optional `target` argument (bounded like all
@@ -1928,11 +2975,17 @@ fn parse_target_arg(args: &Value, required: bool) -> Result<Option<String>, GuiE
     }
 }
 
+/// An agent-route grounding answer: window-relative point,
+/// confidence, and the optional C1 bbox.
+type AgentAnswer = (i64, i64, f64, Option<vision::PixelBBox>);
+
 /// Parses the optional `agent_answer` argument: absent → None;
 /// present but malformed → an argument error (never silently
 /// ignored — a caller who thinks it answered must learn it did
-/// not).
-fn parse_agent_answer(args: &Value) -> Option<Result<(i64, i64, f64), GuiError>> {
+/// not). The C1 curative shape adds an optional pixel `bbox`
+/// ({x_min, y_min, x_max, y_max}); when present, the act point
+/// is derived as its centre by `hit_from_agent_answer`.
+fn parse_agent_answer(args: &Value) -> Option<Result<AgentAnswer, GuiError>> {
     let answer = args.get("agent_answer")?;
     let parsed = (|| {
         let x = answer
@@ -1947,7 +3000,34 @@ fn parse_agent_answer(args: &Value) -> Option<Result<(i64, i64, f64), GuiError>>
             .get("confidence")
             .and_then(Value::as_f64)
             .ok_or_else(|| GuiError::bad_arguments("agent_answer.confidence must be a number"))?;
-        Ok((x, y, confidence))
+        let bbox = match answer.get("bbox") {
+            None => None,
+            Some(bbox) => {
+                let field = |key: &str| {
+                    bbox.get(key)
+                        .and_then(Value::as_i64)
+                        .ok_or_else(|| {
+                            GuiError::bad_arguments(format!(
+                                "agent_answer.bbox.{key} must be an integer"
+                            ))
+                        })
+                        .and_then(|v| {
+                            i32::try_from(v).map_err(|_| {
+                                GuiError::bad_arguments(format!(
+                                    "agent_answer.bbox.{key} is out of range"
+                                ))
+                            })
+                        })
+                };
+                Some(vision::PixelBBox {
+                    x_min: field("x_min")?,
+                    y_min: field("y_min")?,
+                    x_max: field("x_max")?,
+                    y_max: field("y_max")?,
+                })
+            }
+        };
+        Ok((x, y, confidence, bbox))
     })();
     Some(parsed)
 }
@@ -2047,6 +3127,10 @@ impl ServerHandler for SeahawkServer {
         // S5 vision tools are broker-level (the app is an
         // argument), likewise independent of the downstream.
         tools.extend(Self::vision_tools());
+        // D-230 wiring: the read-class feedback tool, likewise
+        // independent of the downstream and of tooling config
+        // (an unconfigured deployment refuses its calls typed).
+        tools.push(Self::feedback_tool());
         if let Some(surface) = self.surface_snapshot().await {
             tools.extend(surface.tools.iter().map(Self::brokered_tool));
         }
@@ -2101,6 +3185,9 @@ impl ServerHandler for SeahawkServer {
         }
         if name.eq_ignore_ascii_case(VISION_GROUND) {
             return Ok(self.vision_ground(arguments).await.into());
+        }
+        if name.eq_ignore_ascii_case(CODE_FEEDBACK) {
+            return Ok(self.code_feedback(arguments).await.into());
         }
         if name.eq_ignore_ascii_case(VISION_ACT_VERIFIED) {
             let operator_token = context
