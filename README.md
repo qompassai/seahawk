@@ -79,6 +79,51 @@ stay execute for exactly that reason).
   `gui.<app>.actuate` with the same gravity as enabling an
   execute-class tool for that application.
 
+## Vision grounding (S5, hardened by the 1.0 curative round)
+
+Three broker-level tools give the broker eyes, gated by the
+same `decide()` lattice as everything else (grounding is
+perception only — it grants no permission):
+
+- **`gui.observe`** (read): a registered app's frame *with*
+  display geometry, stored under its SHA-256; results carry the
+  resolved `window_id` and a blank-frame content verdict
+  (`content` | `suspect_blank`).
+- **`gui.ground`** (read): a natural-language target → the
+  element's **bbox** plus the point derived as its centre, via
+  a local Ollama-served vision model or the calling agent
+  answering the broker's ticket. The centre is derived, never
+  estimated — the curative fix for the S5 benchmark's
+  trailing-edge aim bias.
+- **`gui.act_verified`** (actuate): act and verify against a
+  fresh capture. The `changed` check can be anchored
+  (`changed_around`) or full-frame (`full_frame`); point-less
+  actions diff the full frame by default. Retries *change
+  strategy* (refined description, then route/crop escalation)
+  and stop early on an identical re-ground. Frames that stay
+  suspect-blank through a bounded content poll refuse the act
+  (`seahawk_gui_suspect_blank`), and a caller may pin
+  `window_id` against silent retargeting
+  (`seahawk_gui_window_mismatch`). Visual verdicts follow the
+  frozen Visual Benchmark v1 (`BENCH-VISUAL.md`).
+
+## Code feedback (D-230 wiring)
+
+**`code.feedback`** (read) closes the loop between brokered
+GUI work and the estate's language tooling: per file it returns
+LSP diagnostics (theodolite headless route; GDScript via
+periscope), lint verdicts and format `changed` flags
+(periscope running diver's own pipelines — Seahawk consumes
+the catalog live through periscope, never a second hardcoded
+list), file hashes, and the catalog provenance. Calls are
+bounded episodes (3 per workspace + file set per window; the
+4th is refused with the last counts). A route that cannot
+serve a check answers `seahawk_tooling_unavailable` — feedback
+is never assumed clean, and it never writes: the tooling
+client's dispatch table contains no apply/write call at all.
+Wiring is opt-in policy data (`[[tooling]]` + `[feedback]` in
+`seahawk.example.toml`).
+
 ## Honest limits
 
 Seahawk cannot firewall Epic's port: a local process that bypasses
@@ -89,6 +134,9 @@ port. The full threat model is in `SURFACE.md`.
 
 ## Status
 
-Lab-only (Owner ruling, D-146/D-169). No publication is
-authorized; the repository home is
-<https://github.com/qompassai/seahawk> pending a landing decision.
+**1.0.0** — lab-only (Owner ruling, D-146/D-169). The safety
+charter is unchanged and binding: token auth, execute- and
+actuate-class default-deny via `decide()`, append-only op log,
+lab-only. Publication to crates.io / the MCP registry is held
+for the Owner's word (see `CHANGELOG.md` and the 1.0 gate
+report). Repository: <https://github.com/qompassai/seahawk>.
