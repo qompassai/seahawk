@@ -51,16 +51,21 @@ pub mod codes {
     pub const BAD_RECORD: &str = "seahawk_acquisition_bad_record";
 }
 
-/// Per-file size ceiling: ~4.6x the largest file observed in the
-/// lane (the Marsha-chan acquisition ZIP, 115,656,598 bytes).
-pub const MAX_FILE_BYTES: u64 = 536_870_912;
-/// Per-work total ceiling across all captured files.
-pub const MAX_WORK_BYTES: u64 = 2_147_483_648;
+/// Per-file size ceiling. Raised for the game-acquisition
+/// pilot (D-478 follow-on): single-file game archives of
+/// 8–16 GiB are routine in this class; 16 GiB covers them
+/// with headroom while staying a real ceiling.
+pub const MAX_FILE_BYTES: u64 = 17_179_869_184; // 16 GiB
+/// Per-work total ceiling across all captured files. A
+/// base+DLC game work's captured total can reach tens of
+/// GiB; 64 GiB bounds one work while four pilot works at
+/// the cap (256 GiB) fit primo's free space comfortably.
+pub const MAX_WORK_BYTES: u64 = 68_719_476_736; // 64 GiB
 /// Per-work file-count ceiling (the worked example holds 116).
 pub const MAX_FILES_PER_WORK: usize = 4_096;
 /// Domain allowlist, initial entry (D-246). Policy data at
 /// landing may extend this list; code never does.
-pub const ALLOWED_DOMAINS: [&str; 1] = ["doujins.com"];
+pub const ALLOWED_DOMAINS: [&str; 2] = ["doujins.com", "new.lewd.ninja"];
 /// S5 frozen-benchmark status. The S5 gate FAILED as frozen
 /// (GATE-REPORT-S5: G1 7/11 = 63.6% against a >=90% bar; the bar
 /// does not move). While this is false, unattended acquisition
