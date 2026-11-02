@@ -366,6 +366,750 @@ fn screenshot_mislabelled_as_original_is_caught() {
     let _ = fs::remove_dir_all(&root);
 }
 
+// ------------------------------------------------------- primo_fetch (D-503)
+//
+// All fetch tests run against a loopback HTTP fixture server in
+// this file — never the live site. The fetch core takes its
+// allowlist and limits as parameters, so the fixture's host
+// (127.0.0.1) is the allowlist here and the caps are kilobyte
+// scale; the production path passes ALLOWED_DOMAINS and
+// FetchLimits::lane().
+
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use seahawk::acquisition::{
+    ALLOWED_DOMAINS, FETCH_USER_AGENT, FetchChain, FetchLimits, Refusal, attach_fetch_provenance,
+    build_fetch_client, check_fetch_target, fetch_file, fetch_file_name, fetch_page, media_dir,
+    stream_fetch, work_dir,
+};
+
+const PAGE_BODY: &[u8] =
+    b"<html><head><title>Fixture Page</title></head><body>seahawk fetch fixture</body></html>\n";
+const PAGE_SHA256: &str = "9bbad039709cb37c38bbd759d7873dbf1f24bce53f0741b59193ffef92334739";
+const LOOPBACK_ALLOWED: [&str; 1] = ["127.0.0.1"];
+
+struct Fixture {
+    base: String,
+    foreign_base: String,
+    hits: Arc<AtomicUsize>,
+    user_agents: Arc<Mutex<Vec<String>>>,
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn fixture_route(
+    path: &str,
+    primary: &str,
+    foreign: &str,
+) -> (u16, Vec<(String, String)>, Vec<u8>) {
+    let redirect = |to: &str| {
+        (
+            302,
+            vec![("Location".to_string(), to.to_string())],
+            Vec::new(),
+        )
+    };
+    match path {
+        "/page" => (200, vec![], PAGE_BODY.to_vec()),
+        "/dl/photo.jpg" => (200, vec![], jpeg_bytes(42)),
+        "/redir-in" => redirect("/dl/photo.jpg"),
+        "/redir-off" => redirect("http://evil.example.net/dl/photo.jpg"),
+        // D-504 designated-host routes: `foreign` is the same
+        // listener under its localhost name, so a hop to it
+        // changes the host STRING (127.0.0.1 -> localhost) —
+        // which is what the chain rule keys on — while
+        // staying reachable on one listener.
+        "/redir-designated" => redirect(&format!("{foreign}/dl/photo.jpg")),
+        "/redir-designated-back" => redirect(&format!("{foreign}/redir-back")),
+        "/redir-second-foreign" => redirect(&format!("{foreign}/redir-second")),
+        "/redir-back" => redirect(&format!("{primary}/dl/photo.jpg")),
+        "/redir-second" => redirect("http://127.0.0.3:9/dl/photo.jpg"),
+        "/big" => (200, vec![], vec![0xAA; 8192]),
+        "/missing" => (404, vec![], b"no such fixture".to_vec()),
+        "/slow" => {
+            std::thread::sleep(Duration::from_secs(2));
+            (200, vec![], PAGE_BODY.to_vec())
+        }
+        _ if path.starts_with("/chain") => {
+            let n: usize = path
+                .rsplit('=')
+                .next()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            if n >= 7 {
+                (200, vec![], PAGE_BODY.to_vec())
+            } else {
+                redirect(&format!("/chain?n={}", n + 1))
+            }
+        }
+        _ => (404, vec![], b"unknown fixture path".to_vec()),
+    }
+}
+
+fn handle_fixture(
+    mut stream: std::net::TcpStream,
+    hits: Arc<AtomicUsize>,
+    user_agents: Arc<Mutex<Vec<String>>>,
+    primary: String,
+    foreign: String,
+) {
+    hits.fetch_add(1, Ordering::SeqCst);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let head = loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => return,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+                    break String::from_utf8_lossy(&buf[..pos]).into_owned();
+                }
+            }
+            Err(_) => return,
+        }
+    };
+    let path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
+    for line in head.lines() {
+        if line.to_ascii_lowercase().starts_with("user-agent:")
+            && let Some((_, value)) = line.split_once(':')
+        {
+            user_agents
+                .lock()
+                .expect("user-agent lock")
+                .push(value.trim().to_string());
+        }
+    }
+    let (status, headers, body) = fixture_route(&path, &primary, &foreign);
+    let reason = match status {
+        200 => "OK",
+        302 => "Found",
+        _ => "Not Found",
+    };
+    let mut out = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    )
+    .into_bytes();
+    for (name, value) in &headers {
+        out.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+    }
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(&body);
+    let _ = stream.write_all(&out);
+}
+
+fn start_fixture() -> Fixture {
+    // One listener, two host strings for it: the primary base
+    // (127.0.0.1, the test allowlist) and the foreign base
+    // (localhost, which resolves to the same listener but is
+    // NOT on the allowlist) so D-504 designated-host chains
+    // can actually complete. A second loopback address
+    // (127.0.0.2) was tried first and is not connectable in
+    // this sandbox; the host-string distinction is what the
+    // chain rule keys on, so localhost carries the test.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+    let port = listener.local_addr().expect("fixture addr").port();
+    let base = format!("http://127.0.0.1:{port}");
+    let foreign_base = format!("http://localhost:{port}");
+    let hits = Arc::new(AtomicUsize::new(0));
+    let user_agents = Arc::new(Mutex::new(Vec::new()));
+    let thread_hits = hits.clone();
+    let thread_uas = user_agents.clone();
+    let thread_primary = base.clone();
+    let thread_foreign = foreign_base.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let hits = thread_hits.clone();
+            let uas = thread_uas.clone();
+            let primary = thread_primary.clone();
+            let foreign = thread_foreign.clone();
+            std::thread::spawn(move || handle_fixture(stream, hits, uas, primary, foreign));
+        }
+    });
+    Fixture {
+        base,
+        foreign_base,
+        hits,
+        user_agents,
+    }
+}
+
+fn test_limits() -> FetchLimits {
+    FetchLimits {
+        max_file_bytes: 1_000_000,
+        max_work_bytes: 1_000_000,
+        total_timeout: Duration::from_secs(10),
+    }
+}
+
+fn dir_listing(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .map(|read| {
+            read.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+// ------------------------------------------------------- fetch validation
+
+#[test]
+fn primo_fetch_transport_roundtrips_and_plans() {
+    assert_eq!(Transport::parse("primo_fetch"), Some(Transport::PrimoFetch));
+    assert_eq!(Transport::PrimoFetch.as_str(), "primo_fetch");
+    let work = cleared_work();
+    assert!(decide_acquire(&work, Transport::PrimoFetch, Mode::Supervised, true).is_ok());
+    let root = temp_dir("fetch-plan");
+    let plan = seahawk::acquisition::plan(&work, Transport::PrimoFetch, Mode::Supervised, &root);
+    assert_eq!(plan["transport"], json!("primo_fetch"));
+    assert!(
+        plan["steps"][0]
+            .as_str()
+            .expect("step")
+            .contains("action=fetch"),
+        "a primo_fetch plan must name the fetch action: {}",
+        plan["steps"][0]
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn fetch_page_stores_evidence_outside_the_media_census() {
+    let fixture = start_fixture();
+    let client = build_fetch_client().expect("client");
+    let root = temp_dir("fetch-page");
+    let payload = fetch_page(
+        &client,
+        &cleared_work(),
+        &format!("{}/page", fixture.base),
+        &root,
+        &LOOPBACK_ALLOWED,
+        &test_limits(),
+    )
+    .expect("page fetch");
+    assert_eq!(payload["kind"], json!("page"));
+    assert_eq!(payload["status"], json!(200));
+    assert_eq!(payload["bytes"], json!(PAGE_BODY.len()));
+    assert_eq!(payload["sha256"], json!(PAGE_SHA256));
+
+    let dir = work_dir(&root, "test-work");
+    let stored = fs::read(dir.join("page.html")).expect("page.html evidence stored");
+    assert_eq!(
+        stored, PAGE_BODY,
+        "stored evidence is the fetched body, byte for byte"
+    );
+    // The evidence lives in the work dir, NOT the media dir:
+    // the manifest census sees no media at all.
+    let refusal = census_media(&media_dir(&dir), &BTreeMap::new()).expect_err("no media");
+    assert_eq!(refusal.code, codes::NO_MEDIA);
+    assert_eq!(dir_listing(&dir), vec!["page.html".to_string()]);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn fetch_file_lands_bytes_and_manifest_censuses_them() {
+    let fixture = start_fixture();
+    let client = build_fetch_client().expect("client");
+    let root = temp_dir("fetch-file");
+    let work = cleared_work();
+    let payload = fetch_file(
+        &client,
+        &work,
+        &format!("{}/dl/photo.jpg", fixture.base),
+        &root,
+        &LOOPBACK_ALLOWED,
+        &test_limits(),
+    )
+    .expect("file fetch");
+    assert_eq!(payload["file_name"], json!("photo.jpg"));
+    assert_eq!(payload["bytes"], json!(68));
+    let dir = work_dir(&root, "test-work");
+    let entries = census_media(&media_dir(&dir), &BTreeMap::new()).expect("census");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name, "photo.jpg");
+    assert_eq!(
+        json!(entries[0].sha256),
+        payload["sha256"],
+        "the manifest census hash must match the fetch hash"
+    );
+    let manifest = build_manifest(&work, &entries, 1_700_000_000);
+    assert_eq!(manifest["file_count"], json!(1));
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn fetch_redirect_within_allowlist_is_followed() {
+    let fixture = start_fixture();
+    let client = build_fetch_client().expect("client");
+    let root = temp_dir("fetch-redir-in");
+    let payload = fetch_file(
+        &client,
+        &cleared_work(),
+        &format!("{}/redir-in", fixture.base),
+        &root,
+        &LOOPBACK_ALLOWED,
+        &test_limits(),
+    )
+    .expect("redirected file fetch");
+    assert!(
+        payload["final_url"]
+            .as_str()
+            .expect("final url")
+            .ends_with("/dl/photo.jpg"),
+        "final URL is the redirect target: {}",
+        payload["final_url"]
+    );
+    assert_eq!(
+        payload["file_name"],
+        json!("photo.jpg"),
+        "the file name derives from the FINAL URL"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn fetch_sends_the_browser_user_agent() {
+    let fixture = start_fixture();
+    let client = build_fetch_client().expect("client");
+    let root = temp_dir("fetch-ua");
+    fetch_page(
+        &client,
+        &cleared_work(),
+        &format!("{}/page", fixture.base),
+        &root,
+        &LOOPBACK_ALLOWED,
+        &test_limits(),
+    )
+    .expect("page fetch");
+    let agents = fixture.user_agents.lock().expect("user-agent lock");
+    assert_eq!(agents.len(), 1);
+    assert_eq!(agents[0], FETCH_USER_AGENT);
+    let _ = fs::remove_dir_all(&root);
+}
+
+// ------------------------------------------------------- fetch adversarial
+
+#[test]
+fn fetch_unattended_primo_fetch_is_refused_by_the_mode_gate() {
+    // The S5 unattended refusal is mode-based, not
+    // transport-based: it must fire for primo_fetch unchanged.
+    let refusal = decide_acquire(
+        &cleared_work(),
+        Transport::PrimoFetch,
+        Mode::Unattended,
+        true,
+    )
+    .expect_err("must refuse");
+    assert_eq!(refusal.code, codes::UNATTENDED_BLOCKED);
+}
+
+#[test]
+fn fetch_lane_disabled_is_refused() {
+    let refusal = decide_acquire(
+        &cleared_work(),
+        Transport::PrimoFetch,
+        Mode::Supervised,
+        false,
+    )
+    .expect_err("must refuse");
+    assert_eq!(refusal.code, codes::DISABLED);
+}
+
+#[test]
+fn fetch_undetermined_work_is_refused() {
+    let work = WorkRecord::from_json(&work_json(
+        "UNDETERMINED",
+        "https://doujins.com/gallery/1/test-work-1",
+    ))
+    .expect("work parses");
+    let refusal = decide_acquire(&work, Transport::PrimoFetch, Mode::Supervised, true)
+        .expect_err("must refuse");
+    assert_eq!(refusal.code, codes::NOT_CLEARED);
+}
+
+#[test]
+fn fetch_non_allowlist_host_is_refused_before_any_socket() {
+    let fixture = start_fixture();
+    let client = build_fetch_client().expect("client");
+    let mut sink = |_chunk: &[u8]| -> Result<(), Refusal> { Ok(()) };
+    let refusal = stream_fetch(
+        &client,
+        &format!("{}/page", fixture.base),
+        &["doujins.com"],
+        &test_limits(),
+        None,
+        FetchChain::AllowlistOnly,
+        &mut sink,
+    )
+    .expect_err("must refuse");
+    assert_eq!(refusal.code, codes::DOMAIN_REFUSED);
+    assert_eq!(
+        fixture.hits.load(Ordering::SeqCst),
+        0,
+        "a non-allowlisted host is refused before any socket use"
+    );
+}
+
+#[test]
+fn fetch_page_redirect_off_allowlist_is_refused() {
+    // D-504: a PAGE chain never leaves the allowlist, so the
+    // same off-allowlist redirect a file chain may designate
+    // still refuses here.
+    let fixture = start_fixture();
+    let client = build_fetch_client().expect("client");
+    let root = temp_dir("fetch-page-redir-off");
+    let refusal = fetch_page(
+        &client,
+        &cleared_work(),
+        &format!("{}/redir-off", fixture.base),
+        &root,
+        &LOOPBACK_ALLOWED,
+        &test_limits(),
+    )
+    .expect_err("must refuse");
+    assert_eq!(refusal.code, codes::REDIRECT_REFUSED);
+    assert!(
+        refusal.message.contains("evil.example.net"),
+        "the refusal names the off-allowlist host: {}",
+        refusal.message
+    );
+    let dir = work_dir(&root, "test-work");
+    assert!(
+        dir_listing(&dir).is_empty(),
+        "no partial evidence after a redirect refusal"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn fetch_file_completes_on_the_first_site_designated_host() {
+    // D-504: a file chain that starts allowlisted may
+    // complete on the first non-allowlist host the site's
+    // route designates, and that host is recorded.
+    let fixture = start_fixture();
+    let client = build_fetch_client().expect("client");
+    let root = temp_dir("fetch-designated");
+    let payload = fetch_file(
+        &client,
+        &cleared_work(),
+        &format!("{}/redir-designated", fixture.base),
+        &root,
+        &LOOPBACK_ALLOWED,
+        &test_limits(),
+    )
+    .expect("designated file fetch");
+    assert_eq!(payload["file_name"], json!("photo.jpg"));
+    assert_eq!(payload["site_designated_host"], json!("localhost"));
+    assert!(
+        fixture.hits.load(Ordering::SeqCst) >= 2,
+        "the designated host was actually contacted (initial + designated hop)"
+    );
+    let dir = work_dir(&root, "test-work");
+    let history = fs::read_to_string(dir.join("fetch-history.json")).expect("fetch history");
+    assert!(
+        history.contains("localhost"),
+        "the designated host is in the fetch history: {history}"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn fetch_file_return_to_allowlist_keeps_the_designation_record() {
+    // D-504: returning to the allowlist is fine, and the
+    // designation already made stays on the record even
+    // though the final host is allowlisted.
+    let fixture = start_fixture();
+    let client = build_fetch_client().expect("client");
+    let root = temp_dir("fetch-designated-back");
+    let payload = fetch_file(
+        &client,
+        &cleared_work(),
+        &format!("{}/redir-designated-back", fixture.base),
+        &root,
+        &LOOPBACK_ALLOWED,
+        &test_limits(),
+    )
+    .expect("returning file fetch");
+    assert_eq!(payload["file_name"], json!("photo.jpg"));
+    assert!(
+        payload["final_url"]
+            .as_str()
+            .expect("final url")
+            .starts_with(&fixture.base),
+        "the chain ended back on the allowlist: {}",
+        payload["final_url"]
+    );
+    assert_eq!(payload["site_designated_host"], json!("localhost"));
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn fetch_file_second_foreign_host_is_refused() {
+    // D-504: a hop to a DIFFERENT non-allowlist host after a
+    // designation refuses, before any socket to that host.
+    let fixture = start_fixture();
+    let client = build_fetch_client().expect("client");
+    let root = temp_dir("fetch-second-foreign");
+    let refusal = fetch_file(
+        &client,
+        &cleared_work(),
+        &format!("{}/redir-second-foreign", fixture.base),
+        &root,
+        &LOOPBACK_ALLOWED,
+        &test_limits(),
+    )
+    .expect_err("must refuse");
+    assert_eq!(refusal.code, codes::REDIRECT_REFUSED);
+    assert!(
+        refusal.message.contains("127.0.0.3"),
+        "the refusal names the second foreign host: {}",
+        refusal.message
+    );
+    let dir = work_dir(&root, "test-work");
+    assert!(
+        dir_listing(&media_dir(&dir)).is_empty(),
+        "no partial and no landed file after a redirect refusal"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn fetch_file_cold_foreign_start_is_refused() {
+    // D-504: the designation must come from the site's route,
+    // not the caller — a caller-supplied foreign start refuses
+    // before any socket use, for files exactly as for pages.
+    let fixture = start_fixture();
+    let client = build_fetch_client().expect("client");
+    let root = temp_dir("fetch-cold-foreign");
+    let refusal = fetch_file(
+        &client,
+        &cleared_work(),
+        &format!("{}/dl/photo.jpg", fixture.foreign_base),
+        &root,
+        &LOOPBACK_ALLOWED,
+        &test_limits(),
+    )
+    .expect_err("must refuse");
+    assert_eq!(refusal.code, codes::DOMAIN_REFUSED);
+    assert_eq!(
+        fixture.hits.load(Ordering::SeqCst),
+        0,
+        "a cold foreign start is refused before any socket use"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn fetch_manifest_records_the_site_designated_host() {
+    // D-504: the designated host reaches the manifest through
+    // fetch_provenance, not only through the fetch result.
+    let fixture = start_fixture();
+    let client = build_fetch_client().expect("client");
+    let root = temp_dir("fetch-manifest-prov");
+    let work = cleared_work();
+    fetch_file(
+        &client,
+        &work,
+        &format!("{}/redir-designated", fixture.base),
+        &root,
+        &LOOPBACK_ALLOWED,
+        &test_limits(),
+    )
+    .expect("designated file fetch");
+    let dir = work_dir(&root, "test-work");
+    let entries = census_media(&media_dir(&dir), &BTreeMap::new()).expect("census");
+    let mut manifest = build_manifest(&work, &entries, 1_700_000_000);
+    attach_fetch_provenance(&mut manifest, &dir);
+    assert_eq!(
+        manifest["fetch_provenance"][0]["site_designated_host"],
+        json!("localhost")
+    );
+    assert_eq!(
+        manifest["fetch_provenance"][0]["file_name"],
+        json!("photo.jpg")
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn fetch_redirect_chain_over_the_ceiling_is_refused() {
+    let fixture = start_fixture();
+    let client = build_fetch_client().expect("client");
+    let root = temp_dir("fetch-chain");
+    let refusal = fetch_page(
+        &client,
+        &cleared_work(),
+        &format!("{}/chain?n=0", fixture.base),
+        &root,
+        &LOOPBACK_ALLOWED,
+        &test_limits(),
+    )
+    .expect_err("must refuse");
+    assert_eq!(refusal.code, codes::REDIRECT_REFUSED);
+    let dir = work_dir(&root, "test-work");
+    assert!(
+        dir_listing(&dir).is_empty(),
+        "no partial evidence after a redirect refusal"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn fetch_file_cap_breach_mid_stream_leaves_no_partial() {
+    let fixture = start_fixture();
+    let client = build_fetch_client().expect("client");
+    let root = temp_dir("fetch-file-cap");
+    let limits = FetchLimits {
+        max_file_bytes: 1024,
+        ..test_limits()
+    };
+    let refusal = fetch_file(
+        &client,
+        &cleared_work(),
+        &format!("{}/big", fixture.base),
+        &root,
+        &LOOPBACK_ALLOWED,
+        &limits,
+    )
+    .expect_err("must refuse");
+    assert_eq!(refusal.code, codes::FILE_TOO_LARGE);
+    let dir = work_dir(&root, "test-work");
+    assert!(
+        dir_listing(&media_dir(&dir)).is_empty(),
+        "a mid-stream cap breach leaves no partial file"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn fetch_work_cap_breach_is_refused_and_leaves_no_partial() {
+    let fixture = start_fixture();
+    let client = build_fetch_client().expect("client");
+    let root = temp_dir("fetch-work-cap");
+    let dir = work_dir(&root, "test-work");
+    let mdir = media_dir(&dir);
+    fs::create_dir_all(&mdir).expect("media dir");
+    fs::write(mdir.join("existing.bin"), vec![0u8; 900]).expect("seed existing media");
+    let limits = FetchLimits {
+        max_work_bytes: 1000,
+        ..test_limits()
+    };
+    let refusal = fetch_file(
+        &client,
+        &cleared_work(),
+        &format!("{}/big", fixture.base),
+        &root,
+        &LOOPBACK_ALLOWED,
+        &limits,
+    )
+    .expect_err("must refuse");
+    assert_eq!(refusal.code, codes::WORK_TOO_LARGE);
+    assert_eq!(
+        dir_listing(&mdir),
+        vec!["existing.bin".to_string()],
+        "only the pre-existing file remains; the partial is deleted"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn fetch_non_2xx_is_refused_with_the_status_recorded() {
+    let fixture = start_fixture();
+    let client = build_fetch_client().expect("client");
+    let root = temp_dir("fetch-404");
+    let refusal = fetch_page(
+        &client,
+        &cleared_work(),
+        &format!("{}/missing", fixture.base),
+        &root,
+        &LOOPBACK_ALLOWED,
+        &test_limits(),
+    )
+    .expect_err("must refuse");
+    assert_eq!(refusal.code, codes::FETCH_STATUS);
+    assert!(
+        refusal.message.contains("404"),
+        "the refusal records the status: {}",
+        refusal.message
+    );
+    let dir = work_dir(&root, "test-work");
+    assert!(
+        dir_listing(&dir).is_empty(),
+        "no evidence stored for a refused status"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn fetch_https_preflight_refuses_http_and_foreign_hosts() {
+    assert!(check_fetch_target("https://new.lewd.ninja/game/1-x", &ALLOWED_DOMAINS).is_ok());
+    assert!(check_fetch_target("https://doujins.com/gallery/1-x", &ALLOWED_DOMAINS).is_ok());
+    let http = check_fetch_target("http://new.lewd.ninja/game/1-x", &ALLOWED_DOMAINS)
+        .expect_err("plain HTTP must refuse");
+    assert_eq!(http.code, codes::DOMAIN_REFUSED);
+    let foreign = check_fetch_target("https://example.com/game/1-x", &ALLOWED_DOMAINS)
+        .expect_err("foreign host must refuse");
+    assert_eq!(foreign.code, codes::DOMAIN_REFUSED);
+    let lookalike = check_fetch_target("https://new.lewd.ninja.example.com/x", &ALLOWED_DOMAINS)
+        .expect_err("suffix lookalike must refuse: hosts match whole, never by suffix");
+    assert_eq!(lookalike.code, codes::DOMAIN_REFUSED);
+}
+
+#[test]
+fn fetch_file_name_refuses_traversal_and_accepts_plain_names() {
+    assert_eq!(
+        fetch_file_name("https://h.example/dl/photo.jpg?dl=1").expect("plain name"),
+        "photo.jpg"
+    );
+    assert_eq!(
+        fetch_file_name("https://h.example/dl/my%20file.jpg").expect("decoded name"),
+        "my file.jpg"
+    );
+    for url in [
+        "https://h.example/%2e%2e%2fsecret",
+        "https://h.example/dl/a%2Fb.jpg",
+        "https://h.example/dl/a%5Cb.jpg",
+        "https://h.example/dl/",
+        "https://h.example/%2e%2e",
+        "https://h.example/dl/%zz.jpg",
+    ] {
+        let refusal = fetch_file_name(url).expect_err("must refuse");
+        assert_eq!(refusal.code, codes::BAD_RECORD, "url {url}");
+    }
+}
+
+#[test]
+fn fetch_timeout_is_bounded() {
+    let fixture = start_fixture();
+    let client = build_fetch_client().expect("client");
+    let limits = FetchLimits {
+        total_timeout: Duration::from_millis(500),
+        ..test_limits()
+    };
+    let mut sink = |_chunk: &[u8]| -> Result<(), Refusal> { Ok(()) };
+    let refusal = stream_fetch(
+        &client,
+        &format!("{}/slow", fixture.base),
+        &LOOPBACK_ALLOWED,
+        &limits,
+        None,
+        FetchChain::AllowlistOnly,
+        &mut sink,
+    )
+    .expect_err("must refuse");
+    assert_eq!(refusal.code, codes::FETCH_FAILED);
+}
+
 #[test]
 fn deletion_is_refused_for_unverified_failed_and_held_states() {
     let manifest_for = |state: &str, hold: Option<&str>| {
