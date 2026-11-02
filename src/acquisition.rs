@@ -12,7 +12,9 @@
 //! `primo_fetch` (D-503): the broker process fetches over HTTPS
 //! through the fetch core at the bottom of this module, under
 //! exactly the same `decide()` gate and caps as every other
-//! transport.
+//! transport, with the D-504 chain rule (file chains start
+//! allowlisted and may complete on the first site-designated
+//! host; page chains never leave the allowlist).
 //!
 //! Lane law (D-246): CLEARED-determination works and allowlisted
 //! domains only; download-class captures only (the site's own
@@ -443,9 +445,11 @@ pub fn media_dir(work_dir: &Path) -> PathBuf {
 pub fn plan(work: &WorkRecord, transport: Transport, mode: Mode, quarantine_root: &Path) -> Value {
     let dir = work_dir(quarantine_root, &work.slug);
     let capture_step = match transport {
-        Transport::PrimoFetch => "seahawk_acquire action=fetch (primo_fetch transport) \
+        Transport::PrimoFetch => {
+            "seahawk_acquire action=fetch (primo_fetch transport) \
              fetches captured files into media_dir (download-class only); kind=page \
-             fetches store page.html evidence in the work dir, outside the media census",
+             fetches store page.html evidence in the work dir, outside the media census"
+        }
         _ => "transport places captured files into media_dir (download-class only)",
     };
     json!({
@@ -1127,14 +1131,35 @@ impl FetchLimits {
     }
 }
 
+/// The redirect-chain policy for a `primo_fetch` fetch. The
+/// chain always starts on an allowlisted host (a cold foreign
+/// start is refused before any socket use); what differs by
+/// kind is what a redirect off the allowlist may do.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FetchChain {
+    /// Every hop must stay on the allowlist: a redirect to
+    /// any other host is refused (D-503; `kind=page`).
+    AllowlistOnly,
+    /// The chain may complete on the first non-allowlist host
+    /// the site's own route designates (D-504; `kind=file`):
+    /// hops to a *different* non-allowlist host are refused,
+    /// and returning to the allowlist is fine. The designation
+    /// comes from the site's route, never from the caller.
+    SiteDesignated,
+}
+
 /// What one completed fetch moved: byte count, content hash,
-/// the URL the redirect chain ended on, and its final status.
+/// the URL the redirect chain ended on, its final status, and
+/// — for a `kind=file` chain that left the allowlist — the
+/// first site-designated host the transfer completed through
+/// (D-504; `None` when the chain never left the allowlist).
 #[derive(Debug)]
 pub struct FetchOutcome {
     pub bytes: u64,
     pub final_url: String,
     pub sha256: String,
     pub status: u16,
+    pub site_designated_host: Option<String>,
 }
 
 /// Builds the `primo_fetch` transport's HTTP client. This is
@@ -1181,18 +1206,12 @@ pub fn check_fetch_target(url: &str, allowed_hosts: &[&str]) -> Result<(), Refus
             ),
         ));
     }
-    let host = host_of(url).ok_or_else(|| {
-        Refusal::new(
-            codes::BAD_RECORD,
-            format!("fetch URL {url:?} has no host"),
-        )
-    })?;
+    let host = host_of(url)
+        .ok_or_else(|| Refusal::new(codes::BAD_RECORD, format!("fetch URL {url:?} has no host")))?;
     if !fetch_host_allowed(&host, allowed_hosts) {
         return Err(Refusal::new(
             codes::DOMAIN_REFUSED,
-            format!(
-                "fetch host {host:?} is not on the acquisition allowlist {allowed_hosts:?}"
-            ),
+            format!("fetch host {host:?} is not on the acquisition allowlist {allowed_hosts:?}"),
         ));
     }
     Ok(())
@@ -1248,7 +1267,10 @@ pub fn fetch_file_name(final_url: &str) -> Result<String, Refusal> {
     if name.is_empty() || name == "." || name == ".." {
         return Err(refuse("the decoded name is empty or a dot segment"));
     }
-    if name.bytes().any(|b| b == b'/' || b == b'\\' || b < 0x20 || b == 0x7f) {
+    if name
+        .bytes()
+        .any(|b| b == b'/' || b == b'\\' || b < 0x20 || b == 0x7f)
+    {
         return Err(refuse(
             "the decoded name contains a path separator or control byte",
         ));
@@ -1277,15 +1299,22 @@ pub fn media_dir_bytes(dir: &Path) -> u64 {
 
 /// Streams one fetch for the `primo_fetch` transport: a GET on
 /// `url`, following redirects manually (at most
-/// `FETCH_MAX_REDIRECTS` hops, each hop's host re-checked
-/// against `allowed_hosts` BEFORE the hop is taken), the body
-/// streamed to `sink` in bounded chunks while both caps are
-/// enforced mid-stream (`limits.max_file_bytes` for this file;
-/// `work_budget`, when given, is the work's remaining byte
-/// allowance under `limits.max_work_bytes`). One deadline
+/// `FETCH_MAX_REDIRECTS` hops). The chain always starts on an
+/// allowlisted host — a cold foreign start is refused before
+/// any socket is opened — and every hop's host is decided
+/// before the hop is taken: under `FetchChain::AllowlistOnly`
+/// any off-allowlist hop is refused; under
+/// `FetchChain::SiteDesignated` (D-504) the first
+/// off-allowlist hop designates that host for the rest of the
+/// chain (hops within it, and hops back to the allowlist, are
+/// fine) while a hop to a *different* non-allowlist host is
+/// refused. The body streams to `sink` in bounded chunks
+/// while both caps are enforced mid-stream
+/// (`limits.max_file_bytes` for this file; `work_budget`,
+/// when given, is the work's remaining byte allowance under
+/// `limits.max_work_bytes`). One deadline
 /// (`limits.total_timeout`) covers the whole chain, enforced
-/// per request and re-checked at every hop. The initial host is
-/// checked before any socket is opened. On any refusal the
+/// per request and re-checked at every hop. On any refusal the
 /// caller owns deleting the partial output.
 pub fn stream_fetch(
     client: &reqwest::blocking::Client,
@@ -1293,15 +1322,12 @@ pub fn stream_fetch(
     allowed_hosts: &[&str],
     limits: &FetchLimits,
     work_budget: Option<u64>,
+    chain: FetchChain,
     sink: &mut dyn FnMut(&[u8]) -> Result<(), Refusal>,
 ) -> Result<FetchOutcome, Refusal> {
     let deadline = Instant::now() + limits.total_timeout;
-    let first_host = host_of(url).ok_or_else(|| {
-        Refusal::new(
-            codes::BAD_RECORD,
-            format!("fetch URL {url:?} has no host"),
-        )
-    })?;
+    let first_host = host_of(url)
+        .ok_or_else(|| Refusal::new(codes::BAD_RECORD, format!("fetch URL {url:?} has no host")))?;
     if !fetch_host_allowed(&first_host, allowed_hosts) {
         return Err(Refusal::new(
             codes::DOMAIN_REFUSED,
@@ -1313,6 +1339,10 @@ pub fn stream_fetch(
     }
     let mut current = url.to_string();
     let mut hops = 0usize;
+    // The one non-allowlist host this chain may complete
+    // through, once the site's own route designates it
+    // (D-504). `None` until the first off-allowlist hop.
+    let mut designated: Option<String> = None;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -1365,14 +1395,38 @@ pub fn stream_fetch(
                     .to_string();
                 let next_host = host_of(&next).unwrap_or_default();
                 if !fetch_host_allowed(&next_host, allowed_hosts) {
-                    return Err(Refusal::new(
-                        codes::REDIRECT_REFUSED,
-                        format!(
-                            "redirect from {current:?} points at host {next_host:?}, which \
-                             is not on the acquisition allowlist {allowed_hosts:?}; the \
-                             hop was not taken"
-                        ),
-                    ));
+                    match chain {
+                        FetchChain::AllowlistOnly => {
+                            return Err(Refusal::new(
+                                codes::REDIRECT_REFUSED,
+                                format!(
+                                    "redirect from {current:?} points at host \
+                                     {next_host:?}, which is not on the acquisition \
+                                     allowlist {allowed_hosts:?}; the hop was not taken"
+                                ),
+                            ));
+                        }
+                        FetchChain::SiteDesignated => match &designated {
+                            None => {
+                                // The site's own route
+                                // designates this host for the
+                                // rest of the chain (D-504).
+                                designated = Some(next_host);
+                            }
+                            Some(host) if host.eq_ignore_ascii_case(&next_host) => {}
+                            Some(host) => {
+                                return Err(Refusal::new(
+                                    codes::REDIRECT_REFUSED,
+                                    format!(
+                                        "redirect from {current:?} points at a second \
+                                         non-allowlist host {next_host:?}; this chain \
+                                         already designated {host:?} (D-504), so the \
+                                         hop was not taken"
+                                    ),
+                                ));
+                            }
+                        },
+                    }
                 }
                 hops += 1;
                 current = next;
@@ -1438,6 +1492,7 @@ pub fn stream_fetch(
             final_url: current,
             sha256: hex_encode(&digest),
             status: status.as_u16(),
+            site_designated_host: designated,
         });
     }
 }
@@ -1452,15 +1507,13 @@ fn fetch_to_part(
     allowed_hosts: &[&str],
     limits: &FetchLimits,
     work_budget: Option<u64>,
+    chain: FetchChain,
     part_path: &Path,
 ) -> Result<FetchOutcome, Refusal> {
     let mut file = fs::File::create(part_path).map_err(|e| {
         Refusal::new(
             codes::FETCH_FAILED,
-            format!(
-                "cannot create partial capture {}: {e}",
-                part_path.display()
-            ),
+            format!("cannot create partial capture {}: {e}", part_path.display()),
         )
     })?;
     let result = stream_fetch(
@@ -1469,14 +1522,12 @@ fn fetch_to_part(
         allowed_hosts,
         limits,
         work_budget,
+        chain,
         &mut |chunk| {
             file.write_all(chunk).map_err(|e| {
                 Refusal::new(
                     codes::FETCH_FAILED,
-                    format!(
-                        "cannot write partial capture {}: {e}",
-                        part_path.display()
-                    ),
+                    format!("cannot write partial capture {}: {e}", part_path.display()),
                 )
             })
         },
@@ -1493,7 +1544,9 @@ fn fetch_to_part(
 /// the media dir, so the manifest census never picks it up.
 /// The body streams to a `.part` file first and is renamed
 /// into place only on success; a refused or failed fetch
-/// leaves no partial evidence behind.
+/// leaves no partial evidence behind. A page chain never
+/// leaves the allowlist (D-504): any off-allowlist redirect
+/// is refused, and `site_designated_host` is always null.
 pub fn fetch_page(
     client: &reqwest::blocking::Client,
     work: &WorkRecord,
@@ -1510,7 +1563,15 @@ pub fn fetch_page(
         )
     })?;
     let part_path = dir.join(format!("{PAGE_EVIDENCE_FILE}.part"));
-    let outcome = fetch_to_part(client, url, allowed_hosts, limits, None, &part_path)?;
+    let outcome = fetch_to_part(
+        client,
+        url,
+        allowed_hosts,
+        limits,
+        None,
+        FetchChain::AllowlistOnly,
+        &part_path,
+    )?;
     let stored = dir.join(PAGE_EVIDENCE_FILE);
     fs::rename(&part_path, &stored).map_err(|e| {
         let _ = fs::remove_file(&part_path);
@@ -1529,16 +1590,60 @@ pub fn fetch_page(
         "status": outcome.status,
         "bytes": outcome.bytes,
         "sha256": outcome.sha256,
+        "site_designated_host": outcome.site_designated_host,
         "stored_path": stored.display().to_string(),
     }))
 }
 
-/// `kind=file` fetch (D-503): streams the body into the work's
-/// media dir under the name derived from the final URL, with
-/// the lane caps enforced mid-stream (see `stream_fetch`). An
-/// existing file with the derived name is never overwritten —
-/// re-fetching over a captured (possibly manifested) file is a
-/// caller error, refused after the partial is deleted.
+/// Appends one file-fetch record to the work's
+/// `fetch-history.json` (created on first use). Best effort
+/// by design: provenance must never fail a fetch that already
+/// succeeded, so every failure here is swallowed. The
+/// manifest action attaches this history to the manifest as
+/// `fetch_provenance` (see `attach_fetch_provenance`), which
+/// is how a D-504 site-designated host reaches the manifest.
+fn record_fetch_history(work_dir_path: &Path, record: Value) {
+    let path = work_dir_path.join("fetch-history.json");
+    let mut history = fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .unwrap_or_else(|| json!({"fetches": []}));
+    if let Some(fetches) = history.get_mut("fetches").and_then(Value::as_array_mut) {
+        fetches.push(record);
+    }
+    let _ = write_json_atomic(&path, &history);
+}
+
+/// Attaches a work's fetch history (written by `fetch_file`
+/// runs) to a manifest document under `fetch_provenance`.
+/// Absent or unreadable history is not an error — most works
+/// have none, and a manifest must never fail for want of
+/// provenance.
+pub fn attach_fetch_provenance(manifest: &mut Value, work_dir_path: &Path) {
+    let Ok(text) = fs::read_to_string(work_dir_path.join("fetch-history.json")) else {
+        return;
+    };
+    let Ok(history) = serde_json::from_str::<Value>(&text) else {
+        return;
+    };
+    if let (Some(fetches), Some(obj)) = (history.get("fetches"), manifest.as_object_mut()) {
+        obj.insert("fetch_provenance".to_string(), fetches.clone());
+    }
+}
+
+/// `kind=file` fetch (D-503, chain rule D-504): streams the
+/// body into the work's media dir under the name derived from
+/// the final URL, with the lane caps enforced mid-stream (see
+/// `stream_fetch`). The chain must start on an allowlisted
+/// host and may complete on the first non-allowlist host the
+/// site's route designates; that host is recorded in the
+/// result's `site_designated_host` and appended to the work's
+/// `fetch-history.json`, which the manifest action attaches to
+/// the manifest as `fetch_provenance` — so every designated
+/// host is on the record twice over. An existing file with
+/// the derived name is never overwritten — re-fetching over a
+/// captured (possibly manifested) file is a caller error,
+/// refused after the partial is deleted.
 pub fn fetch_file(
     client: &reqwest::blocking::Client,
     work: &WorkRecord,
@@ -1558,7 +1663,15 @@ pub fn fetch_file(
     let prior = media_dir_bytes(&mdir);
     let work_budget = Some(limits.max_work_bytes.saturating_sub(prior));
     let part_path = mdir.join(".fetch.part");
-    let outcome = fetch_to_part(client, url, allowed_hosts, limits, work_budget, &part_path)?;
+    let outcome = fetch_to_part(
+        client,
+        url,
+        allowed_hosts,
+        limits,
+        work_budget,
+        FetchChain::SiteDesignated,
+        &part_path,
+    )?;
     let name = match fetch_file_name(&outcome.final_url) {
         Ok(name) => name,
         Err(refusal) => {
@@ -1581,6 +1694,19 @@ pub fn fetch_file(
             format!("cannot store fetched file at {}: {e}", stored.display()),
         )
     })?;
+    record_fetch_history(
+        &dir,
+        json!({
+            "kind": "file",
+            "url": url,
+            "final_url": outcome.final_url,
+            "site_designated_host": outcome.site_designated_host,
+            "bytes": outcome.bytes,
+            "sha256": outcome.sha256,
+            "file_name": name,
+            "fetched_at_unix": unix_now(),
+        }),
+    );
     Ok(json!({
         "action": "fetch",
         "kind": "file",
@@ -1591,6 +1717,7 @@ pub fn fetch_file(
         "status": outcome.status,
         "bytes": outcome.bytes,
         "sha256": outcome.sha256,
+        "site_designated_host": outcome.site_designated_host,
         "file_name": name,
         "stored_path": stored.display().to_string(),
     }))
