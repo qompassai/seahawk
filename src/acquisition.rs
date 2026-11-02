@@ -8,7 +8,11 @@
 //! deletion lifecycle. A transport only ever places files into a
 //! work's quarantine media dir and reports a capture method per
 //! file; every policy decision sits here, so no transport can
-//! widen the lane.
+//! widen the lane. The one transport that fetches bytes itself is
+//! `primo_fetch` (D-503): the broker process fetches over HTTPS
+//! through the fetch core at the bottom of this module, under
+//! exactly the same `decide()` gate and caps as every other
+//! transport.
 //!
 //! Lane law (D-246): CLEARED-determination works and allowlisted
 //! domains only; download-class captures only (the site's own
@@ -23,8 +27,9 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -39,6 +44,9 @@ pub mod codes {
     pub const DOMAIN_REFUSED: &str = "seahawk_acquisition_domain_refused";
     pub const UNATTENDED_BLOCKED: &str = "seahawk_acquisition_unattended_blocked";
     pub const TRANSPORT_BLOCKED: &str = "seahawk_acquisition_transport_blocked";
+    pub const FETCH_FAILED: &str = "seahawk_acquisition_fetch_failed";
+    pub const FETCH_STATUS: &str = "seahawk_acquisition_fetch_status";
+    pub const REDIRECT_REFUSED: &str = "seahawk_acquisition_redirect_refused";
     pub const FILE_TOO_LARGE: &str = "seahawk_acquisition_file_too_large";
     pub const WORK_TOO_LARGE: &str = "seahawk_acquisition_work_too_large";
     pub const TOO_MANY_FILES: &str = "seahawk_acquisition_too_many_files";
@@ -76,6 +84,26 @@ pub const S5_BENCHMARK_GREEN: bool = false;
 pub const S5_GATE_EVIDENCE: &str = "S5 frozen benchmark FAILED (GATE-REPORT-S5: G1 7/11 = 63.6% \
      vs >=90% bar, G2 63.6% vs >=98%, A1 4/7 vs 100%, T1 0/2; R1 refusals 5/5); no green \
      frozen re-run is on record";
+/// Connect timeout for the `primo_fetch` transport (D-503).
+pub const FETCH_CONNECT_TIMEOUT_SECS: u64 = 15;
+/// Redirect ceiling for the `primo_fetch` transport (D-503):
+/// at most this many hops are followed, and only while every
+/// hop's host stays on the acquisition allowlist.
+pub const FETCH_MAX_REDIRECTS: usize = 5;
+/// Per-fetch total time budget for the `primo_fetch` transport
+/// (D-503): the connect, every redirect hop, and the body
+/// stream share one deadline.
+pub const FETCH_TOTAL_TIMEOUT_SECS: u64 = 300;
+/// A mainstream browser User-Agent for the `primo_fetch`
+/// transport: the allowlisted sites serve their pages to
+/// browser-class agents.
+pub const FETCH_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
+     (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+/// The evidence file a `kind=page` fetch writes in a work's
+/// quarantine dir. It is deliberately NOT in the media dir: a
+/// captured source page is provenance evidence, never media,
+/// and the manifest census must not pick it up.
+pub const PAGE_EVIDENCE_FILE: &str = "page.html";
 
 /// A typed acquisition refusal: a stable code plus a bounded,
 /// human-readable message.
@@ -162,6 +190,9 @@ impl CaptureMethod {
 pub enum Transport {
     /// Supervised live-browser harness (the pilot transport).
     BrowserHarness,
+    /// The broker process itself fetches over HTTPS (D-503) —
+    /// for deployments whose host has no refused fetch route.
+    PrimoFetch,
     /// Seahawk's own GUI tools — gated on the S5 benchmark.
     SeahawkGui,
 }
@@ -170,6 +201,7 @@ impl Transport {
     pub fn parse(raw: &str) -> Option<Self> {
         match raw {
             "browser_harness" => Some(Self::BrowserHarness),
+            "primo_fetch" => Some(Self::PrimoFetch),
             "seahawk_gui" => Some(Self::SeahawkGui),
             _ => None,
         }
@@ -178,6 +210,7 @@ impl Transport {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::BrowserHarness => "browser_harness",
+            Self::PrimoFetch => "primo_fetch",
             Self::SeahawkGui => "seahawk_gui",
         }
     }
@@ -409,6 +442,12 @@ pub fn media_dir(work_dir: &Path) -> PathBuf {
 /// the contract a transport executes; it performs no capture.
 pub fn plan(work: &WorkRecord, transport: Transport, mode: Mode, quarantine_root: &Path) -> Value {
     let dir = work_dir(quarantine_root, &work.slug);
+    let capture_step = match transport {
+        Transport::PrimoFetch => "seahawk_acquire action=fetch (primo_fetch transport) \
+             fetches captured files into media_dir (download-class only); kind=page \
+             fetches store page.html evidence in the work dir, outside the media census",
+        _ => "transport places captured files into media_dir (download-class only)",
+    };
     json!({
         "slug": work.slug,
         "title": work.title,
@@ -427,7 +466,7 @@ pub fn plan(work: &WorkRecord, transport: Transport, mode: Mode, quarantine_root
             "max_files_per_work": MAX_FILES_PER_WORK,
         },
         "steps": [
-            "transport places captured files into media_dir (download-class only)",
+            capture_step,
             "seahawk_acquire action=manifest censuses media_dir into manifest.json",
             "seahawk_acquire action=verify re-hashes media_dir against manifest.json",
             "seahawk_acquire action=ingest writes ingest-packet.json for neemu",
@@ -500,11 +539,12 @@ fn is_ingestible(media_type: &str) -> bool {
     )
 }
 
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    hex_encode(&Sha256::digest(bytes))
 }
 
 /// Censuses a media directory into file entries, enforcing the
@@ -1051,4 +1091,507 @@ pub fn manifest_has_ingestible_original(manifest: &Value) -> bool {
             })
         })
         .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------
+// primo_fetch transport (D-503): the broker process itself fetches.
+//
+// Every other transport places files into quarantine from outside
+// the process; this one fetches over HTTPS from inside it, for
+// deployments (primo) whose network route carries no fetch
+// refusal. The gate strength is identical: the verb runs
+// `decide_acquire()` first, then `check_fetch_target()` as a
+// pre-flight, and `stream_fetch` re-checks every host it is about
+// to touch — the initial URL and every redirect hop — against the
+// allowlist before the socket work for that hop begins.
+
+/// The `primo_fetch` transport's working limits: the lane caps
+/// plus the per-fetch time budget. `lane()` carries the policy
+/// values; the fields are parameters so tests can exercise the
+/// caps against loopback fixtures at kilobyte scale.
+#[derive(Clone, Copy, Debug)]
+pub struct FetchLimits {
+    pub max_file_bytes: u64,
+    pub max_work_bytes: u64,
+    pub total_timeout: Duration,
+}
+
+impl FetchLimits {
+    /// The lane's policy limits (D-480 caps, D-503 timeouts).
+    pub fn lane() -> Self {
+        Self {
+            max_file_bytes: MAX_FILE_BYTES,
+            max_work_bytes: MAX_WORK_BYTES,
+            total_timeout: Duration::from_secs(FETCH_TOTAL_TIMEOUT_SECS),
+        }
+    }
+}
+
+/// What one completed fetch moved: byte count, content hash,
+/// the URL the redirect chain ended on, and its final status.
+#[derive(Debug)]
+pub struct FetchOutcome {
+    pub bytes: u64,
+    pub final_url: String,
+    pub sha256: String,
+    pub status: u16,
+}
+
+/// Builds the `primo_fetch` transport's HTTP client. This is
+/// the only client in the broker built with TLS (see the
+/// Cargo.toml note): the downstream client keeps its own
+/// unchanged, loopback-only construction in `downstream.rs`.
+/// Redirects are disabled here — `stream_fetch` follows them
+/// manually so every hop's host is checked against the
+/// allowlist before the hop is taken.
+pub fn build_fetch_client() -> Result<reqwest::blocking::Client, Refusal> {
+    reqwest::blocking::Client::builder()
+        .user_agent(FETCH_USER_AGENT)
+        .connect_timeout(Duration::from_secs(FETCH_CONNECT_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(FETCH_TOTAL_TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| {
+            Refusal::new(
+                codes::FETCH_FAILED,
+                format!("cannot build the primo_fetch client: {e}"),
+            )
+        })
+}
+
+/// Exact-host allowlist membership: hosts are compared whole
+/// (never by suffix) and case-insensitively — `host_of` output
+/// is already lowercased; configured entries are policy data.
+pub fn fetch_host_allowed(host: &str, allowed_hosts: &[&str]) -> bool {
+    allowed_hosts.iter().any(|d| d.eq_ignore_ascii_case(host))
+}
+
+/// The `primo_fetch` pre-flight over a caller-supplied URL, run
+/// by the verb before any client is built or socket touched:
+/// HTTPS only, and the host must be on the acquisition
+/// allowlist.
+pub fn check_fetch_target(url: &str, allowed_hosts: &[&str]) -> Result<(), Refusal> {
+    let scheme = url.split("://").next().unwrap_or("");
+    if !scheme.eq_ignore_ascii_case("https") {
+        return Err(Refusal::new(
+            codes::DOMAIN_REFUSED,
+            format!(
+                "fetch URL {url:?} is not an HTTPS URL; the primo_fetch transport \
+                 fetches over HTTPS only"
+            ),
+        ));
+    }
+    let host = host_of(url).ok_or_else(|| {
+        Refusal::new(
+            codes::BAD_RECORD,
+            format!("fetch URL {url:?} has no host"),
+        )
+    })?;
+    if !fetch_host_allowed(&host, allowed_hosts) {
+        return Err(Refusal::new(
+            codes::DOMAIN_REFUSED,
+            format!(
+                "fetch host {host:?} is not on the acquisition allowlist {allowed_hosts:?}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Percent-decodes one URL path segment. Malformed escapes are
+/// a caller error, never a silent pass-through.
+fn percent_decode(segment: &str) -> Result<String, Refusal> {
+    let bad = || {
+        Refusal::new(
+            codes::BAD_RECORD,
+            format!("URL path segment {segment:?} has malformed percent-encoding"),
+        )
+    };
+    let raw = segment.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'%' {
+            let hex = raw.get(i + 1..i + 3).ok_or_else(bad)?;
+            let hex = std::str::from_utf8(hex).map_err(|_| bad())?;
+            let byte = u8::from_str_radix(hex, 16).map_err(|_| bad())?;
+            out.push(byte);
+            i += 3;
+        } else {
+            out.push(raw[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|_| bad())
+}
+
+/// Derives the media-dir file name for a `kind=file` fetch from
+/// the FINAL URL of the redirect chain: the last path segment,
+/// percent-decoded, then validated as a plain file name.
+/// Anything that could traverse out of the media dir —
+/// separators (raw or encoded), dot segments, control bytes,
+/// an empty or over-long name — is refused, never sanitised
+/// into a different name the caller did not ask for.
+pub fn fetch_file_name(final_url: &str) -> Result<String, Refusal> {
+    let refuse = |why: &str| {
+        Refusal::new(
+            codes::BAD_RECORD,
+            format!("cannot derive a safe file name from final URL {final_url:?}: {why}"),
+        )
+    };
+    let path = final_url.split(['?', '#']).next().unwrap_or("");
+    let segment = path.rsplit('/').next().unwrap_or("");
+    if segment.is_empty() {
+        return Err(refuse("the URL path names no file"));
+    }
+    let name = percent_decode(segment)?;
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(refuse("the decoded name is empty or a dot segment"));
+    }
+    if name.bytes().any(|b| b == b'/' || b == b'\\' || b < 0x20 || b == 0x7f) {
+        return Err(refuse(
+            "the decoded name contains a path separator or control byte",
+        ));
+    }
+    if name.len() > 255 {
+        return Err(refuse("the decoded name exceeds 255 bytes"));
+    }
+    Ok(name)
+}
+
+/// Total bytes currently held in a media dir (0 when the dir
+/// does not exist). Sizes only — contents are never read, so
+/// this stays cheap even at the work cap.
+pub fn media_dir_bytes(dir: &Path) -> u64 {
+    let Ok(read) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total: u64 = 0;
+    for entry in read.flatten() {
+        if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            total = total.saturating_add(entry.metadata().map(|m| m.len()).unwrap_or(0));
+        }
+    }
+    total
+}
+
+/// Streams one fetch for the `primo_fetch` transport: a GET on
+/// `url`, following redirects manually (at most
+/// `FETCH_MAX_REDIRECTS` hops, each hop's host re-checked
+/// against `allowed_hosts` BEFORE the hop is taken), the body
+/// streamed to `sink` in bounded chunks while both caps are
+/// enforced mid-stream (`limits.max_file_bytes` for this file;
+/// `work_budget`, when given, is the work's remaining byte
+/// allowance under `limits.max_work_bytes`). One deadline
+/// (`limits.total_timeout`) covers the whole chain, enforced
+/// per request and re-checked at every hop. The initial host is
+/// checked before any socket is opened. On any refusal the
+/// caller owns deleting the partial output.
+pub fn stream_fetch(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    allowed_hosts: &[&str],
+    limits: &FetchLimits,
+    work_budget: Option<u64>,
+    sink: &mut dyn FnMut(&[u8]) -> Result<(), Refusal>,
+) -> Result<FetchOutcome, Refusal> {
+    let deadline = Instant::now() + limits.total_timeout;
+    let first_host = host_of(url).ok_or_else(|| {
+        Refusal::new(
+            codes::BAD_RECORD,
+            format!("fetch URL {url:?} has no host"),
+        )
+    })?;
+    if !fetch_host_allowed(&first_host, allowed_hosts) {
+        return Err(Refusal::new(
+            codes::DOMAIN_REFUSED,
+            format!(
+                "fetch host {first_host:?} is not on the acquisition allowlist \
+                 {allowed_hosts:?}"
+            ),
+        ));
+    }
+    let mut current = url.to_string();
+    let mut hops = 0usize;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Refusal::new(
+                codes::FETCH_FAILED,
+                format!(
+                    "fetch of {url:?} exceeded its {}s total budget",
+                    limits.total_timeout.as_secs()
+                ),
+            ));
+        }
+        let mut response = client
+            .get(&current)
+            .timeout(remaining)
+            .send()
+            .map_err(|e| {
+                Refusal::new(
+                    codes::FETCH_FAILED,
+                    format!("fetch of {current:?} failed: {e}"),
+                )
+            })?;
+        let status = response.status();
+        if status.is_redirection() {
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            if let Some(location) = location {
+                if hops >= FETCH_MAX_REDIRECTS {
+                    return Err(Refusal::new(
+                        codes::REDIRECT_REFUSED,
+                        format!(
+                            "fetch of {url:?} exceeded the {FETCH_MAX_REDIRECTS}-redirect \
+                             ceiling"
+                        ),
+                    ));
+                }
+                let next = reqwest::Url::parse(&current)
+                    .and_then(|base| base.join(&location))
+                    .map_err(|e| {
+                        Refusal::new(
+                            codes::REDIRECT_REFUSED,
+                            format!(
+                                "redirect from {current:?} has an unusable Location \
+                                 {location:?}: {e}"
+                            ),
+                        )
+                    })?
+                    .to_string();
+                let next_host = host_of(&next).unwrap_or_default();
+                if !fetch_host_allowed(&next_host, allowed_hosts) {
+                    return Err(Refusal::new(
+                        codes::REDIRECT_REFUSED,
+                        format!(
+                            "redirect from {current:?} points at host {next_host:?}, which \
+                             is not on the acquisition allowlist {allowed_hosts:?}; the \
+                             hop was not taken"
+                        ),
+                    ));
+                }
+                hops += 1;
+                current = next;
+                continue;
+            }
+            // A redirect status with no usable Location is a
+            // final answer, and not a success: fall through to
+            // the status refusal below.
+        }
+        if !status.is_success() {
+            return Err(Refusal::new(
+                codes::FETCH_STATUS,
+                format!(
+                    "fetch of {current:?} ended with HTTP status {}",
+                    status.as_u16()
+                ),
+            ));
+        }
+        let mut hasher = Sha256::new();
+        let mut bytes: u64 = 0;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = response.read(&mut buffer).map_err(|e| {
+                Refusal::new(
+                    codes::FETCH_FAILED,
+                    format!("fetch of {current:?} failed mid-body: {e}"),
+                )
+            })?;
+            if read == 0 {
+                break;
+            }
+            let chunk = &buffer[..read];
+            bytes = bytes.saturating_add(read as u64);
+            if bytes > limits.max_file_bytes {
+                return Err(Refusal::new(
+                    codes::FILE_TOO_LARGE,
+                    format!(
+                        "fetched file exceeds the {} per-file ceiling mid-stream; the \
+                         partial capture is deleted",
+                        limits.max_file_bytes
+                    ),
+                ));
+            }
+            if let Some(budget) = work_budget
+                && bytes > budget
+            {
+                return Err(Refusal::new(
+                    codes::WORK_TOO_LARGE,
+                    format!(
+                        "fetched file exceeds the work's remaining byte allowance \
+                         ({budget} of the {} per-work ceiling); the partial capture is \
+                         deleted",
+                        limits.max_work_bytes
+                    ),
+                ));
+            }
+            hasher.update(chunk);
+            sink(chunk)?;
+        }
+        let digest = hasher.finalize();
+        return Ok(FetchOutcome {
+            bytes,
+            final_url: current,
+            sha256: hex_encode(&digest),
+            status: status.as_u16(),
+        });
+    }
+}
+
+/// Runs `stream_fetch` into the partial-capture file at
+/// `part_path`, deleting the partial on any refusal (cap
+/// breach, redirect refusal, transport failure) so a failed
+/// fetch never leaves a censused or half-written file behind.
+fn fetch_to_part(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    allowed_hosts: &[&str],
+    limits: &FetchLimits,
+    work_budget: Option<u64>,
+    part_path: &Path,
+) -> Result<FetchOutcome, Refusal> {
+    let mut file = fs::File::create(part_path).map_err(|e| {
+        Refusal::new(
+            codes::FETCH_FAILED,
+            format!(
+                "cannot create partial capture {}: {e}",
+                part_path.display()
+            ),
+        )
+    })?;
+    let result = stream_fetch(
+        client,
+        url,
+        allowed_hosts,
+        limits,
+        work_budget,
+        &mut |chunk| {
+            file.write_all(chunk).map_err(|e| {
+                Refusal::new(
+                    codes::FETCH_FAILED,
+                    format!(
+                        "cannot write partial capture {}: {e}",
+                        part_path.display()
+                    ),
+                )
+            })
+        },
+    );
+    if result.is_err() {
+        drop(file);
+        let _ = fs::remove_file(part_path);
+    }
+    result
+}
+
+/// `kind=page` fetch (D-503): stores the fetched page as
+/// `page.html` evidence in the work's quarantine dir — NOT in
+/// the media dir, so the manifest census never picks it up.
+/// The body streams to a `.part` file first and is renamed
+/// into place only on success; a refused or failed fetch
+/// leaves no partial evidence behind.
+pub fn fetch_page(
+    client: &reqwest::blocking::Client,
+    work: &WorkRecord,
+    url: &str,
+    quarantine_root: &Path,
+    allowed_hosts: &[&str],
+    limits: &FetchLimits,
+) -> Result<Value, Refusal> {
+    let dir = work_dir(quarantine_root, &work.slug);
+    fs::create_dir_all(&dir).map_err(|e| {
+        Refusal::new(
+            codes::FETCH_FAILED,
+            format!("cannot create work dir {}: {e}", dir.display()),
+        )
+    })?;
+    let part_path = dir.join(format!("{PAGE_EVIDENCE_FILE}.part"));
+    let outcome = fetch_to_part(client, url, allowed_hosts, limits, None, &part_path)?;
+    let stored = dir.join(PAGE_EVIDENCE_FILE);
+    fs::rename(&part_path, &stored).map_err(|e| {
+        let _ = fs::remove_file(&part_path);
+        Refusal::new(
+            codes::FETCH_FAILED,
+            format!("cannot store fetched page at {}: {e}", stored.display()),
+        )
+    })?;
+    Ok(json!({
+        "action": "fetch",
+        "kind": "page",
+        "slug": work.slug,
+        "transport": Transport::PrimoFetch.as_str(),
+        "url": url,
+        "final_url": outcome.final_url,
+        "status": outcome.status,
+        "bytes": outcome.bytes,
+        "sha256": outcome.sha256,
+        "stored_path": stored.display().to_string(),
+    }))
+}
+
+/// `kind=file` fetch (D-503): streams the body into the work's
+/// media dir under the name derived from the final URL, with
+/// the lane caps enforced mid-stream (see `stream_fetch`). An
+/// existing file with the derived name is never overwritten —
+/// re-fetching over a captured (possibly manifested) file is a
+/// caller error, refused after the partial is deleted.
+pub fn fetch_file(
+    client: &reqwest::blocking::Client,
+    work: &WorkRecord,
+    url: &str,
+    quarantine_root: &Path,
+    allowed_hosts: &[&str],
+    limits: &FetchLimits,
+) -> Result<Value, Refusal> {
+    let dir = work_dir(quarantine_root, &work.slug);
+    let mdir = media_dir(&dir);
+    fs::create_dir_all(&mdir).map_err(|e| {
+        Refusal::new(
+            codes::FETCH_FAILED,
+            format!("cannot create media dir {}: {e}", mdir.display()),
+        )
+    })?;
+    let prior = media_dir_bytes(&mdir);
+    let work_budget = Some(limits.max_work_bytes.saturating_sub(prior));
+    let part_path = mdir.join(".fetch.part");
+    let outcome = fetch_to_part(client, url, allowed_hosts, limits, work_budget, &part_path)?;
+    let name = match fetch_file_name(&outcome.final_url) {
+        Ok(name) => name,
+        Err(refusal) => {
+            let _ = fs::remove_file(&part_path);
+            return Err(refusal);
+        }
+    };
+    let stored = mdir.join(&name);
+    if stored.exists() {
+        let _ = fs::remove_file(&part_path);
+        return Err(Refusal::new(
+            codes::BAD_RECORD,
+            format!("media dir already holds a file named {name:?}; refusing to overwrite it"),
+        ));
+    }
+    fs::rename(&part_path, &stored).map_err(|e| {
+        let _ = fs::remove_file(&part_path);
+        Refusal::new(
+            codes::FETCH_FAILED,
+            format!("cannot store fetched file at {}: {e}", stored.display()),
+        )
+    })?;
+    Ok(json!({
+        "action": "fetch",
+        "kind": "file",
+        "slug": work.slug,
+        "transport": Transport::PrimoFetch.as_str(),
+        "url": url,
+        "final_url": outcome.final_url,
+        "status": outcome.status,
+        "bytes": outcome.bytes,
+        "sha256": outcome.sha256,
+        "file_name": name,
+        "stored_path": stored.display().to_string(),
+    }))
 }

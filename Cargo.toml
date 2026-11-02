@@ -26,9 +26,17 @@ tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-th
 toml = "0.9"
 anyhow = "1"
 # Downstream client to Epic's server: plain HTTP on loopback, blocking
-# client used only inside spawn_blocking tasks. No TLS features — the
-# downstream is loopback by contract and non-loopback URLs are refused.
-reqwest = { version = "0.12", default-features = false, features = ["blocking"] }
+# client used only inside spawn_blocking tasks. The downstream stays
+# loopback by contract — non-loopback URLs are refused at config parse
+# (config::is_loopback_url) — and its client construction in
+# downstream.rs is unchanged. The rustls-tls feature exists ONLY for
+# the acquisition lane's primo_fetch client (D-503), which is
+# constructed separately in acquisition.rs: Cargo unifies features
+# per crate, so two reqwest clients in one binary cannot be
+# feature-isolated; the isolation here is by construction (separate
+# builder, separate call sites) plus the config-level loopback
+# refusal, which no feature flag can widen.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 # S4 host-GUI provider: pure-Rust X11 client (window enumeration,
 # EWMH focus, XTest input injection, GetImage screenshots). No shell
 # is ever invoked for GUI work — a subprocess would be an
