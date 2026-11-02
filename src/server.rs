@@ -313,7 +313,7 @@ impl SeahawkServer {
             .with_annotations(annotations),
             Tool::new(
                 ACQUIRE_TOOL,
-                "[acquisition lane, D-246/D-248: decide()-gated; every action is op-logged] One verb for the corpus acquisition lane. Actions: plan (typed acquisition plan for a CLEARED work; refuses UNDETERMINED / EXCLUDE / no-record works, non-allowlisted domains, unattended mode, and the seahawk_gui transport — the last two until the S5 frozen benchmark re-passes), manifest (census a work's quarantine media dir into manifest.json: SHA-256, byte counts, sniffed types, capture methods; screenshot_derived files are never original media), verify (read-only audit: re-hash the media dir against the manifest), ingest (verify, then write the neemu ingest packet: neemu_register_work / validate_ingest / screen_work arguments — neemu itself is unchanged), lifecycle (record an extraction state, extraction evidence, or a named hold in the manifest), delete_verified (D-248 lifecycle: dry_run defaults true; real deletion only for verified_complete, unheld works, after full re-verification), sweep (read-only orphan report over the quarantine root). Requires [acquisition] enabled in policy for all but verify/sweep. Work objects carry slug, title, series, tags, source_url, determination {status, record}, tier_claim.",
+                "[acquisition lane, D-246/D-248: decide()-gated; every action is op-logged] One verb for the corpus acquisition lane. Actions: plan (typed acquisition plan for a CLEARED work; refuses UNDETERMINED / EXCLUDE / no-record works, non-allowlisted domains, unattended mode, and the seahawk_gui transport — the last two until the S5 frozen benchmark re-passes), manifest (census a work's quarantine media dir into manifest.json: SHA-256, byte counts, sniffed types, capture methods; screenshot_derived files are never original media), verify (read-only audit: re-hash the media dir against the manifest), ingest (verify, then write the neemu ingest packet: neemu_register_work / validate_ingest / screen_work arguments — neemu itself is unchanged), fetch (D-503; primo_fetch transport only, supervised: the broker process itself fetches over HTTPS under the same decide() gate — kind=page stores the fetched page as page.html evidence in the work dir, outside the media census; kind=file streams a same-allowlist URL into media_dir with the per-file / per-work caps enforced mid-stream and partials deleted on breach; redirects are followed only within the allowlist, at most 5 hops), lifecycle (record an extraction state, extraction evidence, or a named hold in the manifest), delete_verified (D-248 lifecycle: dry_run defaults true; real deletion only for verified_complete, unheld works, after full re-verification), sweep (read-only orphan report over the quarantine root). Requires [acquisition] enabled in policy for all but verify/sweep. Work objects carry slug, title, series, tags, source_url, determination {status, record}, tier_claim.",
                 Arc::new(acquire_schema()),
             )
             .with_annotations(
@@ -3088,7 +3088,7 @@ fn acquire_schema() -> Map<String, Value> {
     let mut props = Map::new();
     props.insert(
         "action".to_string(),
-        json!({"type": "string", "enum": ["plan", "manifest", "verify", "ingest", "lifecycle", "delete_verified", "sweep"], "description": "The lane action to run."}),
+        json!({"type": "string", "enum": ["plan", "manifest", "verify", "ingest", "lifecycle", "delete_verified", "sweep", "fetch"], "description": "The lane action to run."}),
     );
     props.insert(
         "work".to_string(),
@@ -3100,7 +3100,15 @@ fn acquire_schema() -> Map<String, Value> {
     );
     props.insert(
         "transport".to_string(),
-        json!({"type": "string", "enum": ["browser_harness", "seahawk_gui"], "description": "Capture transport (default browser_harness). seahawk_gui refuses until the S5 benchmark gate is green."}),
+        json!({"type": "string", "enum": ["browser_harness", "primo_fetch", "seahawk_gui"], "description": "Capture transport (default browser_harness). seahawk_gui refuses until the S5 benchmark gate is green. primo_fetch (D-503) is the fetch action's transport: the broker process itself fetches over HTTPS."}),
+    );
+    props.insert(
+        "kind".to_string(),
+        json!({"type": "string", "enum": ["file", "page"], "description": "For fetch: page stores the fetched page as page.html evidence in the work dir (outside the media census); file streams the URL into the media dir under the final URL's file name, the lane caps enforced mid-stream."}),
+    );
+    props.insert(
+        "url".to_string(),
+        json!({"type": "string", "description": "For fetch: the URL to fetch. Required for kind=file; for kind=page it defaults to the work's source_url. Must be HTTPS on an allowlisted host; redirects are followed only within the allowlist (max 5 hops) and an off-allowlist redirect is a typed refusal."}),
     );
     props.insert(
         "mode".to_string(),
@@ -3290,6 +3298,101 @@ impl SeahawkServer {
                 acquisition::record_lifecycle(&manifest_path, "ingest_prepared", None, None)?;
                 Ok(packet)
             }
+            "fetch" => {
+                // D-503: the broker process itself fetches, and
+                // only under the primo_fetch transport. The
+                // transport requirement is checked before the
+                // decide() gate so a fetch attempted under any
+                // other transport refuses as the caller error it
+                // is; decide() then applies unchanged (lane
+                // enabled, CLEARED determination, allowlisted
+                // source host, supervised-only under the S5 gate).
+                let transport = args
+                    .get("transport")
+                    .and_then(Value::as_str)
+                    .map(|raw| {
+                        Transport::parse(raw).ok_or_else(|| acquisition::Refusal {
+                            code: acquisition::codes::BAD_RECORD,
+                            message: format!("unknown transport {raw:?}"),
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or(Transport::BrowserHarness);
+                if transport != Transport::PrimoFetch {
+                    return Err(acquisition::Refusal {
+                        code: acquisition::codes::BAD_RECORD,
+                        message: format!(
+                            "action fetch requires transport \"primo_fetch\" (got {:?}); \
+                             the other transports place files themselves",
+                            transport.as_str()
+                        ),
+                    });
+                }
+                let work = WorkRecord::from_json(args.get("work").unwrap_or(&Value::Null))?;
+                let mode = args
+                    .get("mode")
+                    .and_then(Value::as_str)
+                    .map(|raw| {
+                        Mode::parse(raw).ok_or_else(|| acquisition::Refusal {
+                            code: acquisition::codes::BAD_RECORD,
+                            message: format!("unknown mode {raw:?}"),
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or(Mode::Supervised);
+                acquisition::decide_acquire(
+                    &work,
+                    transport,
+                    mode,
+                    self.config.acquisition.enabled,
+                )?;
+                let kind = args
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .filter(|k| *k == "page" || *k == "file")
+                    .ok_or_else(|| acquisition::Refusal {
+                        code: acquisition::codes::BAD_RECORD,
+                        message: "action fetch requires kind \"page\" or \"file\"".to_string(),
+                    })?;
+                let url = match kind {
+                    "page" => args
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .filter(|u| !u.is_empty())
+                        .unwrap_or(&work.source_url)
+                        .to_string(),
+                    _ => args
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .filter(|u| !u.is_empty())
+                        .ok_or_else(|| acquisition::Refusal {
+                            code: acquisition::codes::BAD_RECORD,
+                            message: "action fetch kind=file requires a url".to_string(),
+                        })?
+                        .to_string(),
+                };
+                acquisition::check_fetch_target(&url, &acquisition::ALLOWED_DOMAINS)?;
+                let client = acquisition::build_fetch_client()?;
+                let limits = acquisition::FetchLimits::lane();
+                match kind {
+                    "page" => acquisition::fetch_page(
+                        &client,
+                        &work,
+                        &url,
+                        &root,
+                        &acquisition::ALLOWED_DOMAINS,
+                        &limits,
+                    ),
+                    _ => acquisition::fetch_file(
+                        &client,
+                        &work,
+                        &url,
+                        &root,
+                        &acquisition::ALLOWED_DOMAINS,
+                        &limits,
+                    ),
+                }
+            }
             "lifecycle" => {
                 if !self.config.acquisition.enabled {
                     return Err(acquisition::Refusal {
@@ -3328,7 +3431,7 @@ impl SeahawkServer {
                 code: acquisition::codes::BAD_RECORD,
                 message: format!(
                     "unknown acquisition action {other:?}; expected plan | manifest | \
-                     verify | ingest | lifecycle | delete_verified | sweep"
+                     verify | ingest | fetch | lifecycle | delete_verified | sweep"
                 ),
             }),
         }
