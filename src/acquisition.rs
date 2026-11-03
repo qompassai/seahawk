@@ -9,7 +9,7 @@
 //! work's quarantine media dir and reports a capture method per
 //! file; every policy decision sits here, so no transport can
 //! widen the lane. The one transport that fetches bytes itself is
-//! `primo_fetch` (D-503): the broker process fetches over HTTPS
+//! `seahawk_fetch` (D-503): the broker process fetches over HTTPS
 //! through the fetch core at the bottom of this module, under
 //! exactly the same `decide()` gate and caps as every other
 //! transport, with the D-504 chain rule (file chains start
@@ -86,17 +86,17 @@ pub const S5_BENCHMARK_GREEN: bool = false;
 pub const S5_GATE_EVIDENCE: &str = "S5 frozen benchmark FAILED (GATE-REPORT-S5: G1 7/11 = 63.6% \
      vs >=90% bar, G2 63.6% vs >=98%, A1 4/7 vs 100%, T1 0/2; R1 refusals 5/5); no green \
      frozen re-run is on record";
-/// Connect timeout for the `primo_fetch` transport (D-503).
+/// Connect timeout for the `seahawk_fetch` transport (D-503).
 pub const FETCH_CONNECT_TIMEOUT_SECS: u64 = 15;
-/// Redirect ceiling for the `primo_fetch` transport (D-503):
+/// Redirect ceiling for the `seahawk_fetch` transport (D-503):
 /// at most this many hops are followed, and only while every
 /// hop's host stays on the acquisition allowlist.
 pub const FETCH_MAX_REDIRECTS: usize = 5;
-/// Per-fetch total time budget for the `primo_fetch` transport
+/// Per-fetch total time budget for the `seahawk_fetch` transport
 /// (D-503): the connect, every redirect hop, and the body
 /// stream share one deadline.
 pub const FETCH_TOTAL_TIMEOUT_SECS: u64 = 300;
-/// A mainstream browser User-Agent for the `primo_fetch`
+/// A mainstream browser User-Agent for the `seahawk_fetch`
 /// transport: the allowlisted sites serve their pages to
 /// browser-class agents.
 pub const FETCH_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
@@ -194,7 +194,7 @@ pub enum Transport {
     BrowserHarness,
     /// The broker process itself fetches over HTTPS (D-503) —
     /// for deployments whose host has no refused fetch route.
-    PrimoFetch,
+    SeahawkFetch,
     /// Seahawk's own GUI tools — gated on the S5 benchmark.
     SeahawkGui,
 }
@@ -203,7 +203,7 @@ impl Transport {
     pub fn parse(raw: &str) -> Option<Self> {
         match raw {
             "browser_harness" => Some(Self::BrowserHarness),
-            "primo_fetch" => Some(Self::PrimoFetch),
+            "seahawk_fetch" => Some(Self::SeahawkFetch),
             "seahawk_gui" => Some(Self::SeahawkGui),
             _ => None,
         }
@@ -212,7 +212,7 @@ impl Transport {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::BrowserHarness => "browser_harness",
-            Self::PrimoFetch => "primo_fetch",
+            Self::SeahawkFetch => "seahawk_fetch",
             Self::SeahawkGui => "seahawk_gui",
         }
     }
@@ -445,8 +445,8 @@ pub fn media_dir(work_dir: &Path) -> PathBuf {
 pub fn plan(work: &WorkRecord, transport: Transport, mode: Mode, quarantine_root: &Path) -> Value {
     let dir = work_dir(quarantine_root, &work.slug);
     let capture_step = match transport {
-        Transport::PrimoFetch => {
-            "seahawk_acquire action=fetch (primo_fetch transport) \
+        Transport::SeahawkFetch => {
+            "seahawk_acquire action=fetch (seahawk_fetch transport) \
              fetches captured files into media_dir (download-class only); kind=page \
              fetches store page.html evidence in the work dir, outside the media census"
         }
@@ -1098,7 +1098,7 @@ pub fn manifest_has_ingestible_original(manifest: &Value) -> bool {
 }
 
 // ---------------------------------------------------------------------
-// primo_fetch transport (D-503): the broker process itself fetches.
+// seahawk_fetch transport (D-503): the broker process itself fetches.
 //
 // Every other transport places files into quarantine from outside
 // the process; this one fetches over HTTPS from inside it, for
@@ -1109,7 +1109,7 @@ pub fn manifest_has_ingestible_original(manifest: &Value) -> bool {
 // to touch — the initial URL and every redirect hop — against the
 // allowlist before the socket work for that hop begins.
 
-/// The `primo_fetch` transport's working limits: the lane caps
+/// The `seahawk_fetch` transport's working limits: the lane caps
 /// plus the per-fetch time budget. `lane()` carries the policy
 /// values; the fields are parameters so tests can exercise the
 /// caps against loopback fixtures at kilobyte scale.
@@ -1131,7 +1131,7 @@ impl FetchLimits {
     }
 }
 
-/// The redirect-chain policy for a `primo_fetch` fetch. The
+/// The redirect-chain policy for a `seahawk_fetch` fetch. The
 /// chain always starts on an allowlisted host (a cold foreign
 /// start is refused before any socket use); what differs by
 /// kind is what a redirect off the allowlist may do.
@@ -1162,7 +1162,7 @@ pub struct FetchOutcome {
     pub site_designated_host: Option<String>,
 }
 
-/// Builds the `primo_fetch` transport's HTTP client. This is
+/// Builds the `seahawk_fetch` transport's HTTP client. This is
 /// the only client in the broker built with TLS (see the
 /// Cargo.toml note): the downstream client keeps its own
 /// unchanged, loopback-only construction in `downstream.rs`.
@@ -1179,7 +1179,7 @@ pub fn build_fetch_client() -> Result<reqwest::blocking::Client, Refusal> {
         .map_err(|e| {
             Refusal::new(
                 codes::FETCH_FAILED,
-                format!("cannot build the primo_fetch client: {e}"),
+                format!("cannot build the seahawk_fetch client: {e}"),
             )
         })
 }
@@ -1191,7 +1191,7 @@ pub fn fetch_host_allowed(host: &str, allowed_hosts: &[&str]) -> bool {
     allowed_hosts.iter().any(|d| d.eq_ignore_ascii_case(host))
 }
 
-/// The `primo_fetch` pre-flight over a caller-supplied URL, run
+/// The `seahawk_fetch` pre-flight over a caller-supplied URL, run
 /// by the verb before any client is built or socket touched:
 /// HTTPS only, and the host must be on the acquisition
 /// allowlist.
@@ -1201,7 +1201,7 @@ pub fn check_fetch_target(url: &str, allowed_hosts: &[&str]) -> Result<(), Refus
         return Err(Refusal::new(
             codes::DOMAIN_REFUSED,
             format!(
-                "fetch URL {url:?} is not an HTTPS URL; the primo_fetch transport \
+                "fetch URL {url:?} is not an HTTPS URL; the seahawk_fetch transport \
                  fetches over HTTPS only"
             ),
         ));
@@ -1297,7 +1297,7 @@ pub fn media_dir_bytes(dir: &Path) -> u64 {
     total
 }
 
-/// Streams one fetch for the `primo_fetch` transport: a GET on
+/// Streams one fetch for the `seahawk_fetch` transport: a GET on
 /// `url`, following redirects manually (at most
 /// `FETCH_MAX_REDIRECTS` hops). The chain always starts on an
 /// allowlisted host — a cold foreign start is refused before
@@ -1584,7 +1584,7 @@ pub fn fetch_page(
         "action": "fetch",
         "kind": "page",
         "slug": work.slug,
-        "transport": Transport::PrimoFetch.as_str(),
+        "transport": Transport::SeahawkFetch.as_str(),
         "url": url,
         "final_url": outcome.final_url,
         "status": outcome.status,
@@ -1711,7 +1711,7 @@ pub fn fetch_file(
         "action": "fetch",
         "kind": "file",
         "slug": work.slug,
-        "transport": Transport::PrimoFetch.as_str(),
+        "transport": Transport::SeahawkFetch.as_str(),
         "url": url,
         "final_url": outcome.final_url,
         "status": outcome.status,

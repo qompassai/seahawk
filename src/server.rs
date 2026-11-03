@@ -313,7 +313,7 @@ impl SeahawkServer {
             .with_annotations(annotations),
             Tool::new(
                 ACQUIRE_TOOL,
-                "[acquisition lane, D-246/D-248: decide()-gated; every action is op-logged] One verb for the corpus acquisition lane. Actions: plan (typed acquisition plan for a CLEARED work; refuses UNDETERMINED / EXCLUDE / no-record works, non-allowlisted domains, unattended mode, and the seahawk_gui transport — the last two until the S5 frozen benchmark re-passes), manifest (census a work's quarantine media dir into manifest.json: SHA-256, byte counts, sniffed types, capture methods; screenshot_derived files are never original media), verify (read-only audit: re-hash the media dir against the manifest), ingest (verify, then write the neemu ingest packet: neemu_register_work / validate_ingest / screen_work arguments — neemu itself is unchanged), fetch (D-503, chain rule D-504; primo_fetch transport only, supervised: the broker process itself fetches over HTTPS under the same decide() gate — kind=page stores the fetched page as page.html evidence in the work dir, outside the media census, and its chain never leaves the allowlist; kind=file streams into media_dir with the per-file / per-work caps enforced mid-stream and partials deleted on breach, its chain starting allowlisted and allowed to complete on the first non-allowlist host the site's route designates, recorded as site_designated_host in the result and in the manifest's fetch_provenance, while a hop to a second foreign host or a cold foreign start is refused; at most 5 hops), lifecycle (record an extraction state, extraction evidence, or a named hold in the manifest), delete_verified (D-248 lifecycle: dry_run defaults true; real deletion only for verified_complete, unheld works, after full re-verification), sweep (read-only orphan report over the quarantine root). Requires [acquisition] enabled in policy for all but verify/sweep. Work objects carry slug, title, series, tags, source_url, determination {status, record}, tier_claim.",
+                "[acquisition lane, D-246/D-248: decide()-gated; every action is op-logged] One verb for the corpus acquisition lane. Actions: plan (typed acquisition plan for a CLEARED work; refuses UNDETERMINED / EXCLUDE / no-record works, non-allowlisted domains, unattended mode, and the seahawk_gui transport — the last two until the S5 frozen benchmark re-passes), manifest (census a work's quarantine media dir into manifest.json: SHA-256, byte counts, sniffed types, capture methods; screenshot_derived files are never original media), verify (read-only audit: re-hash the media dir against the manifest), ingest (verify, then write the neemu ingest packet: neemu_register_work / validate_ingest / screen_work arguments — neemu itself is unchanged), fetch (D-503, chain rule D-504; seahawk_fetch transport only, supervised: the broker process itself fetches over HTTPS under the same decide() gate — kind=page stores the fetched page as page.html evidence in the work dir, outside the media census, and its chain never leaves the allowlist; kind=file streams into media_dir with the per-file / per-work caps enforced mid-stream and partials deleted on breach, its chain starting allowlisted and allowed to complete on the first non-allowlist host the site's route designates, recorded as site_designated_host in the result and in the manifest's fetch_provenance, while a hop to a second foreign host or a cold foreign start is refused; at most 5 hops), lifecycle (record an extraction state, extraction evidence, or a named hold in the manifest), delete_verified (D-248 lifecycle: dry_run defaults true; real deletion only for verified_complete, unheld works, after full re-verification), sweep (read-only orphan report over the quarantine root). Requires [acquisition] enabled in policy for all but verify/sweep. Work objects carry slug, title, series, tags, source_url, determination {status, record}, tier_claim.",
                 Arc::new(acquire_schema()),
             )
             .with_annotations(
@@ -3100,7 +3100,7 @@ fn acquire_schema() -> Map<String, Value> {
     );
     props.insert(
         "transport".to_string(),
-        json!({"type": "string", "enum": ["browser_harness", "primo_fetch", "seahawk_gui"], "description": "Capture transport (default browser_harness). seahawk_gui refuses until the S5 benchmark gate is green. primo_fetch (D-503) is the fetch action's transport: the broker process itself fetches over HTTPS."}),
+        json!({"type": "string", "enum": ["browser_harness", "seahawk_fetch", "seahawk_gui"], "description": "Capture transport (default browser_harness). seahawk_gui refuses until the S5 benchmark gate is green. seahawk_fetch (D-503) is the fetch action's transport: the broker process itself fetches over HTTPS."}),
     );
     props.insert(
         "kind".to_string(),
@@ -3305,7 +3305,7 @@ impl SeahawkServer {
             }
             "fetch" => {
                 // D-503: the broker process itself fetches, and
-                // only under the primo_fetch transport. The
+                // only under the seahawk_fetch transport. The
                 // transport requirement is checked before the
                 // decide() gate so a fetch attempted under any
                 // other transport refuses as the caller error it
@@ -3323,11 +3323,11 @@ impl SeahawkServer {
                     })
                     .transpose()?
                     .unwrap_or(Transport::BrowserHarness);
-                if transport != Transport::PrimoFetch {
+                if transport != Transport::SeahawkFetch {
                     return Err(acquisition::Refusal {
                         code: acquisition::codes::BAD_RECORD,
                         message: format!(
-                            "action fetch requires transport \"primo_fetch\" (got {:?}); \
+                            "action fetch requires transport \"seahawk_fetch\" (got {:?}); \
                              the other transports place files themselves",
                             transport.as_str()
                         ),

@@ -366,7 +366,7 @@ fn screenshot_mislabelled_as_original_is_caught() {
     let _ = fs::remove_dir_all(&root);
 }
 
-// ------------------------------------------------------- primo_fetch (D-503)
+// ------------------------------------------------------- seahawk_fetch (D-503)
 //
 // All fetch tests run against a loopback HTTP fixture server in
 // this file — never the live site. The fetch core takes its
@@ -564,20 +564,20 @@ fn dir_listing(dir: &Path) -> Vec<String> {
 // ------------------------------------------------------- fetch validation
 
 #[test]
-fn primo_fetch_transport_roundtrips_and_plans() {
-    assert_eq!(Transport::parse("primo_fetch"), Some(Transport::PrimoFetch));
-    assert_eq!(Transport::PrimoFetch.as_str(), "primo_fetch");
+fn seahawk_fetch_transport_roundtrips_and_plans() {
+    assert_eq!(Transport::parse("seahawk_fetch"), Some(Transport::SeahawkFetch));
+    assert_eq!(Transport::SeahawkFetch.as_str(), "seahawk_fetch");
     let work = cleared_work();
-    assert!(decide_acquire(&work, Transport::PrimoFetch, Mode::Supervised, true).is_ok());
+    assert!(decide_acquire(&work, Transport::SeahawkFetch, Mode::Supervised, true).is_ok());
     let root = temp_dir("fetch-plan");
-    let plan = seahawk::acquisition::plan(&work, Transport::PrimoFetch, Mode::Supervised, &root);
-    assert_eq!(plan["transport"], json!("primo_fetch"));
+    let plan = seahawk::acquisition::plan(&work, Transport::SeahawkFetch, Mode::Supervised, &root);
+    assert_eq!(plan["transport"], json!("seahawk_fetch"));
     assert!(
         plan["steps"][0]
             .as_str()
             .expect("step")
             .contains("action=fetch"),
-        "a primo_fetch plan must name the fetch action: {}",
+        "a seahawk_fetch plan must name the fetch action: {}",
         plan["steps"][0]
     );
     let _ = fs::remove_dir_all(&root);
@@ -700,12 +700,12 @@ fn fetch_sends_the_browser_user_agent() {
 // ------------------------------------------------------- fetch adversarial
 
 #[test]
-fn fetch_unattended_primo_fetch_is_refused_by_the_mode_gate() {
+fn fetch_unattended_seahawk_fetch_is_refused_by_the_mode_gate() {
     // The S5 unattended refusal is mode-based, not
-    // transport-based: it must fire for primo_fetch unchanged.
+    // transport-based: it must fire for seahawk_fetch unchanged.
     let refusal = decide_acquire(
         &cleared_work(),
-        Transport::PrimoFetch,
+        Transport::SeahawkFetch,
         Mode::Unattended,
         true,
     )
@@ -717,7 +717,7 @@ fn fetch_unattended_primo_fetch_is_refused_by_the_mode_gate() {
 fn fetch_lane_disabled_is_refused() {
     let refusal = decide_acquire(
         &cleared_work(),
-        Transport::PrimoFetch,
+        Transport::SeahawkFetch,
         Mode::Supervised,
         false,
     )
@@ -732,7 +732,7 @@ fn fetch_undetermined_work_is_refused() {
         "https://doujins.com/gallery/1/test-work-1",
     ))
     .expect("work parses");
-    let refusal = decide_acquire(&work, Transport::PrimoFetch, Mode::Supervised, true)
+    let refusal = decide_acquire(&work, Transport::SeahawkFetch, Mode::Supervised, true)
         .expect_err("must refuse");
     assert_eq!(refusal.code, codes::NOT_CLEARED);
 }

@@ -30,7 +30,7 @@ anyhow = "1"
 # loopback by contract — non-loopback URLs are refused at config parse
 # (config::is_loopback_url) — and its client construction in
 # downstream.rs is unchanged. The rustls-tls feature exists ONLY for
-# the acquisition lane's primo_fetch client (D-503), which is
+# the acquisition lane's seahawk_fetch client (D-503), which is
 # constructed separately in acquisition.rs: Cargo unifies features
 # per crate, so two reqwest clients in one binary cannot be
 # feature-isolated; the isolation here is by construction (separate

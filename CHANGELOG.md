@@ -1,5 +1,27 @@
 # Changelog — seahawk
 
+## 1.0.0 — landed 2026-11-03 (D-657)
+
+The 1.0.0 line below is now seahawk's line of record on
+`main`, landed together with the acquisition lane
+(D-246/D-248, D-480) and its in-process fetch transport
+(D-503, chain rule D-504). Safety charter unchanged:
+`decide()` strength, the two-host acquisition allowlist
+(`doujins.com`, `new.lewd.ninja`), supervised-only mode, and
+the S5 refusals (GUI transport, unattended mode) carry over
+exactly. Lab-only: no crates.io publish, no registry
+publication — repo + primo deploy only.
+
+### Renamed
+
+- **Transport `primo_fetch` → `seahawk_fetch`** (D-657):
+  the wire string, the `Transport::SeahawkFetch` variant,
+  tool descriptions, and tests carry the new name. New
+  fetch results, fetch-history entries, and manifest
+  `fetch_provenance` record `seahawk_fetch`; historical
+  records written before the rename keep `primo_fetch`
+  as written evidence and are not rewritten.
+
 ## 1.0.0 — 2026-10-29
 
 The fleet-to-1.0 close-out. Safety charter unchanged and

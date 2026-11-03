@@ -44,7 +44,7 @@
 //! prepares the neemu ingest handoff, and runs the
 //! delete-after-verified-extraction lifecycle. Neemu gains no
 //! download surface; it ingests through its existing path.
-//! D-503 adds the `primo_fetch` transport: the broker process
+//! D-503 adds the `seahawk_fetch` transport: the broker process
 //! itself fetches over HTTPS (the verb's `fetch` action) under
 //! the same decide() gate and caps, for deployments whose host
 //! carries no refused fetch route.
