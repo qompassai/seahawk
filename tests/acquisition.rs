@@ -565,7 +565,10 @@ fn dir_listing(dir: &Path) -> Vec<String> {
 
 #[test]
 fn seahawk_fetch_transport_roundtrips_and_plans() {
-    assert_eq!(Transport::parse("seahawk_fetch"), Some(Transport::SeahawkFetch));
+    assert_eq!(
+        Transport::parse("seahawk_fetch"),
+        Some(Transport::SeahawkFetch)
+    );
     assert_eq!(Transport::SeahawkFetch.as_str(), "seahawk_fetch");
     let work = cleared_work();
     assert!(decide_acquire(&work, Transport::SeahawkFetch, Mode::Supervised, true).is_ok());
