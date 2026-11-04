@@ -254,6 +254,10 @@ impl Session {
         let scratch = Scratch::new(stub.port, execute_enabled);
         let mut child = Command::new(env!("CARGO_BIN_EXE_seahawk"))
             .arg(scratch.dir.join("seahawk.toml"))
+            // D-934: this suite exercises the whole surface;
+            // the default profile is `core`, so opt into `full`
+            // explicitly (also exercises env profile selection).
+            .env("SEAHAWK_TOOL_PROFILE", "full")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

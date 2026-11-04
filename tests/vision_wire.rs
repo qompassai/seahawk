@@ -93,6 +93,8 @@ impl Session {
         let scratch = Scratch::new(actuate_enabled, vision);
         let mut child = Command::new(env!("CARGO_BIN_EXE_seahawk"))
             .arg(scratch.dir.join("seahawk.toml"))
+            // D-934: full surface (see tests/wire.rs).
+            .env("SEAHAWK_TOOL_PROFILE", "full")
             .env_remove("DISPLAY")
             .env_remove("WAYLAND_DISPLAY")
             .stdin(Stdio::piped())

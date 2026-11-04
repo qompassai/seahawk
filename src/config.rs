@@ -283,6 +283,10 @@ struct RawServer {
     operator_token: Option<String>,
     #[serde(default)]
     require_token_for_list: bool,
+    /// Tool-surface profile spec (D-934); parsed and validated
+    /// in `Config::parse`, never trusted raw.
+    #[serde(default)]
+    tool_profile: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -347,6 +351,11 @@ pub struct Config {
     pub agent_token_digest: [u8; 32],
     pub operator_token_digest: Option<[u8; 32]>,
     pub require_token_for_list: bool,
+    /// The launch's tool-surface profile (D-934), resolved
+    /// from the config file's `tool_profile`; `main` may
+    /// override it from the environment or `--profile`
+    /// before serving.
+    pub tool_profile: crate::profile::ToolProfile,
     pub downstream_url: String,
     pub downstream_timeout_secs: u64,
     /// Execute-class tools the operator has enabled, lowercased for
@@ -449,10 +458,16 @@ impl Config {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("seahawk-quarantine")),
         };
+        let tool_profile = match &raw.server.tool_profile {
+            Some(spec) => crate::profile::ToolProfile::parse(spec)
+                .map_err(|e| anyhow::anyhow!("config: server.tool_profile: {e}"))?,
+            None => crate::profile::ToolProfile::core(),
+        };
         Ok(Self {
             agent_token_digest: digest(&raw.server.agent_token),
             operator_token_digest: raw.server.operator_token.as_deref().map(digest),
             require_token_for_list: raw.server.require_token_for_list,
+            tool_profile,
             downstream_url: raw.downstream.url,
             downstream_timeout_secs: raw.downstream.timeout_secs,
             execute_enabled: raw
@@ -895,5 +910,26 @@ mod tests {
         assert!(Config::parse(bad_route).is_err());
         let bad_conf = "[server]\nagent_token = \"x\"\n[vision]\nmin_confidence = 1.5\n";
         assert!(Config::parse(bad_conf).is_err());
+    }
+
+    #[test]
+    fn tool_profile_defaults_to_core() {
+        let cfg = Config::parse(MINIMAL).expect("minimal config");
+        assert_eq!(cfg.tool_profile, crate::profile::ToolProfile::core());
+        assert!(cfg.tool_profile.serves_tool("seahawk_status"));
+        assert!(!cfg.tool_profile.serves_tool("seahawk_acquire"));
+    }
+
+    #[test]
+    fn tool_profile_parses_from_server_section() {
+        let text = "[server]\nagent_token = \"x\"\ntool_profile = \"vision,broker\"\n";
+        let cfg = Config::parse(text).expect("config");
+        assert_eq!(cfg.tool_profile.spec_string(), "broker,vision");
+    }
+
+    #[test]
+    fn tool_profile_unknown_pack_is_refused_at_load() {
+        let text = "[server]\nagent_token = \"x\"\ntool_profile = \"visionn\"\n";
+        assert!(Config::parse(text).is_err());
     }
 }

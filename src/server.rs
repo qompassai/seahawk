@@ -632,6 +632,7 @@ impl SeahawkServer {
             },
             "class_overrides": self.config.class_overrides.len(),
             "oplog_path": self.oplog.path().display().to_string(),
+            "tool_profile": self.config.tool_profile.spec_string(),
             "oplog_write_failures": self.oplog.write_failures(),
         });
         json_result(&payload)
@@ -3496,6 +3497,11 @@ impl ServerHandler for SeahawkServer {
         if let Some(surface) = self.surface_snapshot().await {
             tools.extend(surface.tools.iter().map(Self::brokered_tool));
         }
+        // D-934: the launch profile scopes the served surface.
+        // `full` retains everything, so its list is the
+        // unfiltered surface by construction.
+        let profile = &self.config.tool_profile;
+        tools.retain(|tool| profile.serves_tool(&tool.name));
         Ok(ListToolsResult {
             tools,
             ..Default::default()
@@ -3519,6 +3525,26 @@ impl ServerHandler for SeahawkServer {
             .as_ref()
             .map(|m| Value::Object(m.clone()))
             .unwrap_or_else(|| json!({}));
+        // D-934: the profile scopes the callable surface exactly
+        // as it scopes tools/list — a tool the launch profile
+        // does not serve is unknown to this process and refused
+        // with the same typed refusal as a name outside the
+        // downstream surface. This gate only ever narrows:
+        // decide()/policy still govern every served tool.
+        if !self.config.tool_profile.serves_tool(name) {
+            let Decision::Refuse { code, message } = policy::unknown_tool(name) else {
+                unreachable!()
+            };
+            self.oplog.record(
+                name,
+                None,
+                Some(&arguments),
+                &format!("refused:{code}"),
+                None,
+                None,
+            );
+            return Ok(typed_refusal(code, &message).into());
+        }
         // GUI tools dispatch before the brokered surface: their
         // names are Seahawk's own (policy-built), matched
         // case-insensitively so a case variant hits the same
@@ -3623,5 +3649,96 @@ impl ServerHandler for SeahawkServer {
             }
         };
         Ok(result.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{GuiApp, ToolClass, ToolRecord};
+    use crate::profile::{Pack, ToolProfile};
+
+    fn sample_record(name: &str) -> ToolRecord {
+        let (toolset, short) = name.rsplit_once('.').expect("dotted name");
+        ToolRecord {
+            name: name.to_string(),
+            toolset: toolset.to_string(),
+            short_name: short.to_string(),
+            description: "sample".to_string(),
+            input_schema: json!({"type": "object"}),
+            class: ToolClass::Read,
+        }
+    }
+
+    /// The coverage law (D-934): every tool the server builds
+    /// belongs to exactly one pack or to the always-served
+    /// core, and profile classification agrees with the real
+    /// constructors — a future tool added to any constructor
+    /// lands in this census and needs its pack pinned here.
+    #[test]
+    fn coverage_law_over_real_surface_constructors() {
+        let mut census: Vec<(String, Option<Pack>)> = Vec::new();
+        for tool in SeahawkServer::native_tools() {
+            census.push((tool.name.to_string(), ToolProfile::pack_of(&tool.name)));
+        }
+        for tool in SeahawkServer::vision_tools() {
+            census.push((tool.name.to_string(), ToolProfile::pack_of(&tool.name)));
+        }
+        let feedback = SeahawkServer::feedback_tool();
+        census.push((
+            feedback.name.to_string(),
+            ToolProfile::pack_of(&feedback.name),
+        ));
+        let app = GuiApp {
+            name: "blender".to_string(),
+            display_name: "Blender".to_string(),
+            window_match: vec!["Blender".to_string()],
+        };
+        for tool in crate::gui::gui_tools(&app) {
+            census.push((tool.name.to_string(), ToolProfile::pack_of(&tool.name)));
+        }
+        let brokered = SeahawkServer::brokered_tool(&sample_record(
+            "EditorToolset.EditorAppToolset.GetSelectedActors",
+        ));
+        census.push((
+            brokered.name.to_string(),
+            ToolProfile::pack_of(&brokered.name),
+        ));
+
+        let expected: Vec<(&str, Option<Pack>)> = vec![
+            ("seahawk_status", None),
+            ("seahawk_surface", None),
+            ("seahawk_oplog", None),
+            ("seahawk_acquire", Some(Pack::Acquire)),
+            ("gui.observe", Some(Pack::Vision)),
+            ("gui.ground", Some(Pack::Vision)),
+            ("gui.act_verified", Some(Pack::Vision)),
+            ("code.feedback", Some(Pack::Feedback)),
+            ("gui.blender.observe", Some(Pack::Gui)),
+            ("gui.blender.actuate", Some(Pack::Gui)),
+            (
+                "EditorToolset.EditorAppToolset.GetSelectedActors",
+                Some(Pack::Broker),
+            ),
+        ];
+        assert_eq!(census.len(), expected.len());
+        for (name, pack) in &census {
+            let want = expected
+                .iter()
+                .find(|(pinned, _)| pinned == name)
+                .map(|(_, pack)| *pack);
+            assert_eq!(*pack, want.expect("census name is pinned"), "{name}");
+            // Each tool is served by its home profile and — for
+            // pack tools — withheld by core alone.
+            match pack {
+                None => assert!(ToolProfile::core().serves_tool(name), "{name}"),
+                Some(pack) => {
+                    assert!(!ToolProfile::core().serves_tool(name), "{name}");
+                    let home = ToolProfile::parse(pack.name()).expect("pack word");
+                    assert!(home.serves_tool(name), "{name}");
+                }
+            }
+            assert!(ToolProfile::full().serves_tool(name), "{name}");
+        }
     }
 }

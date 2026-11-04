@@ -11,6 +11,13 @@ agent_token = "change-me-agent-token"
 operator_token = "change-me-operator-token"
 # When true, tools/list also requires the agent token.
 require_token_for_list = false
+# Tool-surface profile (D-934): "core" (default — broker
+# status/surface/op-log only), "full" (the unfiltered surface),
+# or a comma-separated list of packs: acquire, broker,
+# feedback, gui, vision. Overridden by the SEAHAWK_TOOL_PROFILE
+# environment variable, then by the --profile launch argument.
+# An unknown pack name refuses startup.
+# tool_profile = "core"
 
 [downstream]
 # Epic's editor MCP server. Loopback only — Seahawk refuses to

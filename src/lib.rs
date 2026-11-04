@@ -57,6 +57,7 @@ pub mod gui;
 pub mod model;
 pub mod oplog;
 pub mod policy;
+pub mod profile;
 pub mod server;
 pub mod tooling;
 pub mod vision;
