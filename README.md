@@ -1,4 +1,5 @@
 # Seahawk
+[![crates.io](https://img.shields.io/crates/v/seahawk.svg)](https://crates.io/crates/seahawk)
 
 The estate's authenticated broker for Unreal Engine's built-in MCP
 server (Epic's `ModelContextProtocol` plugin in UE 5.8). Named for
