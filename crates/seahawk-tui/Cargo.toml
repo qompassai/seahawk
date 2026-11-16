@@ -1,0 +1,26 @@
+[package]
+name = "seahawk-tui"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.88"
+description = "Seahawk TUI — broker console for the seahawk Unreal-editor MCP broker (fleet TUI pattern, D-1562 rung 1): overview, session staging with plan-only execute-class rule, append-only op-log viewer, live log, fleet panel."
+
+[lib]
+name = "seahawk_tui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "seahawk-tui"
+path = "src/main.rs"
+
+[dependencies]
+seahawk = { path = "../.." }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+ratatui = "0.29"
+crossterm = "0.28"
+toml = "0.9"
+
+[lints.clippy]
+all = "warn"
