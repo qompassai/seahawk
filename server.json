@@ -26,7 +26,7 @@
       "transport": {
         "type": "stdio"
       },
-      "version": "1.0.2"
+      "version": "1.0.3"
     }
   ],
   "repository": {
@@ -34,6 +34,6 @@
     "url": "https://github.com/qompassai/seahawk"
   },
   "title": "Seahawk",
-  "version": "1.0.0",
+  "version": "1.0.3",
   "websiteUrl": "https://qompass.ai/solutions/seahawk/"
 }
