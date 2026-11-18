@@ -271,7 +271,7 @@ impl SeahawkServer {
         let mut surface_props = Map::new();
         surface_props.insert(
             "refresh".to_string(),
-            json!({"type": "boolean", "description": "Drop the cached downstream session and rebuild the surface snapshot (toolsets can register late)."}),
+            json!({"type": "boolean", "description": "Rebuild the surface snapshot, dropping the cached downstream session (toolsets can register late)."}),
         );
         let mut surface_schema = Map::new();
         surface_schema.insert("type".to_string(), json!("object"));
@@ -279,7 +279,7 @@ impl SeahawkServer {
         let mut oplog_props = Map::new();
         oplog_props.insert(
             "limit".to_string(),
-            json!({"type": "integer", "description": "How many recent op-log entries to return (default 50, max 500)."}),
+            json!({"type": "integer", "description": "Entries to return (default 50, max 500)."}),
         );
         let mut oplog_schema = Map::new();
         oplog_schema.insert("type".to_string(), json!("object"));
@@ -295,25 +295,25 @@ impl SeahawkServer {
         vec![
             Tool::new(
                 NATIVE_STATUS,
-                "Seahawk broker status: downstream reachability, surface counts, execute policy, op-log health. Does not connect downstream.",
+                "Broker status (read-class): downstream reachability, surface counts, execute policy, op-log health. Does not connect downstream.",
                 Arc::new(status_schema),
             )
             .with_annotations(annotations.clone()),
             Tool::new(
                 NATIVE_SURFACE,
-                "The brokered tool surface: every downstream tool Seahawk exposes, with its class, plus withheld unclassified tools and skipped toolsets. Connects downstream if needed.",
+                "Brokered tool surface (read-class): every downstream tool exposed, with its class, plus withheld unclassified tools and skipped toolsets. Connects downstream if needed.",
                 Arc::new(surface_schema),
             )
             .with_annotations(annotations.clone()),
             Tool::new(
                 NATIVE_OPLOG,
-                "Recent op-log entries (tool, class, args digest, outcome, latency). Digests only — raw argument values are never logged.",
+                "Recent op-log entries (read-class): tool, class, args digest, outcome, latency. Digests only — raw argument values are never logged.",
                 Arc::new(oplog_schema),
             )
             .with_annotations(annotations),
             Tool::new(
                 ACQUIRE_TOOL,
-                "[acquisition lane, D-246/D-248: decide()-gated; every action is op-logged] One verb for the corpus acquisition lane. Actions: plan (typed acquisition plan for a CLEARED work; refuses UNDETERMINED / EXCLUDE / no-record works, non-allowlisted domains, unattended mode, and the seahawk_gui transport — the last two until the S5 frozen benchmark re-passes), manifest (census a work's quarantine media dir into manifest.json: SHA-256, byte counts, sniffed types, capture methods; screenshot_derived files are never original media), verify (read-only audit: re-hash the media dir against the manifest), ingest (verify, then write the neemu ingest packet: neemu_register_work / validate_ingest / screen_work arguments — neemu itself is unchanged), fetch (D-503, chain rule D-504; seahawk_fetch transport only, supervised: the broker process itself fetches over HTTPS under the same decide() gate — kind=page stores the fetched page as page.html evidence in the work dir, outside the media census, and its chain never leaves the allowlist; kind=file streams into media_dir with the per-file / per-work caps enforced mid-stream and partials deleted on breach, its chain starting allowlisted and allowed to complete on the first non-allowlist host the site's route designates, recorded as site_designated_host in the result and in the manifest's fetch_provenance, while a hop to a second foreign host or a cold foreign start is refused; at most 5 hops), lifecycle (record an extraction state, extraction evidence, or a named hold in the manifest), delete_verified (D-248 lifecycle: dry_run defaults true; real deletion only for verified_complete, unheld works, after full re-verification), sweep (read-only orphan report over the quarantine root). Requires [acquisition] enabled in policy for all but verify/sweep. Work objects carry slug, title, series, tags, source_url, determination {status, record}, tier_claim.",
+                "[acquisition lane, D-246/D-248: decide()-gated, op-logged] Corpus acquisition, one verb. plan: typed plan for a CLEARED work — refuses UNDETERMINED/EXCLUDE/no-record works, non-allowlisted domains, unattended mode, seahawk_gui (last two until the S5 benchmark re-passes). manifest: census a work's quarantine media dir into manifest.json (SHA-256, sizes, sniffed types, capture methods; screenshot_derived is never original media). verify: re-hash the media dir against the manifest. ingest: verify, then write the neemu ingest packet. fetch: seahawk_fetch only, supervised (kinds + chain rule in the kind/url properties). lifecycle: record extraction state, evidence, or a named hold. delete_verified: dry_run default true; real deletion only for verified_complete unheld works after full re-verification. sweep: orphan report over the quarantine root. [acquisition] policy required except verify/sweep. Work fields in the work property (determination = {status, record}); bare slug accepted for manifest/ingest/fetch/lifecycle.",
                 Arc::new(acquire_schema()),
             )
             .with_annotations(
@@ -339,7 +339,7 @@ impl SeahawkServer {
         let mut observe_props = Map::new();
         observe_props.insert(
             "app".to_string(),
-            json!({"type": "string", "description": "Registered GUI application name (see seahawk_status gui_apps, e.g. \"blender\"). Unregistered names are refused with seahawk_unknown_tool."}),
+            json!({"type": "string", "description": "Registered app name (see seahawk_status gui_apps, e.g. \"blender\"); unregistered refused seahawk_unknown_tool."}),
         );
         let mut observe_schema = Map::new();
         observe_schema.insert("type".to_string(), json!("object"));
@@ -349,19 +349,19 @@ impl SeahawkServer {
         let mut ground_props = Map::new();
         ground_props.insert(
             "frame_sha256".to_string(),
-            json!({"type": "string", "description": "Digest of a frame returned by gui.observe (or gui.act_verified). The broker grounds against exactly those pixels; unknown or evicted digests are refused with seahawk_gui_no_frame."}),
+            json!({"type": "string", "description": "Frame digest from gui.observe / gui.act_verified; unknown or evicted refused seahawk_gui_no_frame."}),
         );
         ground_props.insert(
             "target".to_string(),
-            json!({"type": "string", "description": "Natural-language description of the UI element to locate, e.g. \"the Queue button\" or \"the render engine selector\"."}),
+            json!({"type": "string", "description": "UI element to locate, in natural language."}),
         );
         ground_props.insert(
             "route".to_string(),
-            json!({"type": "string", "enum": ["local", "agent"], "description": "Grounding route. local: the broker's configured local vision model answers. agent: you answer — the first call returns status awaiting_agent_answer with the frame as an image; call again with the same frame_sha256 and target plus agent_answer. Default: the broker's configured route."}),
+            json!({"type": "string", "enum": ["local", "agent"], "description": "Route: local (broker's vision model) or agent (first call returns awaiting_agent_answer + the frame; re-call with agent_answer). Default: configured."}),
         );
         ground_props.insert(
             "agent_answer".to_string(),
-            json!({"type": "object", "description": "Your grounding answer for the agent route: the element's center in WINDOW-RELATIVE pixels of the referenced frame, plus your confidence. Optional bbox {x_min, y_min, x_max, y_max} (window-relative pixels): when given, the broker acts on the bbox centre.", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "confidence": {"type": "number"}, "bbox": {"type": "object", "properties": {"x_min": {"type": "integer"}, "y_min": {"type": "integer"}, "x_max": {"type": "integer"}, "y_max": {"type": "integer"}}, "required": ["x_min", "y_min", "x_max", "y_max"]}}, "required": ["x", "y", "confidence"]}),
+            json!({"type": "object", "description": "Agent-route answer: element center (window-relative px) + confidence; optional bbox {x_min, y_min, x_max, y_max} — broker acts on its centre.", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "confidence": {"type": "number"}, "bbox": {"type": "object", "properties": {"x_min": {"type": "integer"}, "y_min": {"type": "integer"}, "x_max": {"type": "integer"}, "y_max": {"type": "integer"}}, "required": ["x_min", "y_min", "x_max", "y_max"]}}, "required": ["x", "y", "confidence"]}),
         );
         let mut ground_schema = Map::new();
         ground_schema.insert("type".to_string(), json!("object"));
@@ -371,65 +371,65 @@ impl SeahawkServer {
         let mut act_props = Map::new();
         act_props.insert(
             "app".to_string(),
-            json!({"type": "string", "description": "Registered GUI application name (see seahawk_status gui_apps). Unregistered names are refused with seahawk_unknown_tool."}),
+            json!({"type": "string", "description": "Registered app name (see seahawk_status gui_apps); unregistered refused seahawk_unknown_tool."}),
         );
         act_props.insert(
             "action".to_string(),
-            json!({"type": "string", "enum": ["focus", "click", "double_click", "key", "type", "scroll", "drag"], "description": "The input action — the same closed vocabulary as gui.<app>.actuate. There is no run/execute action."}),
+            json!({"type": "string", "enum": ["focus", "click", "double_click", "key", "type", "scroll", "drag"], "description": "Input action (gui.<app>.actuate vocabulary; no run/execute)."}),
         );
         act_props.insert(
             "target".to_string(),
-            json!({"type": "string", "description": "Natural-language description of the element to act on. The broker grounds it on a fresh capture before each attempt. Mutually exclusive with raw x/y targeting (drag requires raw coordinates)."}),
+            json!({"type": "string", "description": "Element to act on (natural language); grounded on a fresh capture per attempt. Exclusive with raw x/y (drag needs raw)."}),
         );
         act_props.insert(
             "x".to_string(),
-            json!({"type": "integer", "description": "Raw targeting: window-relative x for click / double_click / scroll."}),
+            json!({"type": "integer", "description": "Raw window-relative x."}),
         );
         act_props.insert(
             "y".to_string(),
-            json!({"type": "integer", "description": "Raw targeting: window-relative y for click / double_click / scroll."}),
+            json!({"type": "integer", "description": "Raw window-relative y."}),
         );
         act_props.insert(
             "button".to_string(),
-            json!({"type": "integer", "enum": [1, 2, 3], "description": "Mouse button for click (default 1)."}),
+            json!({"type": "integer", "enum": [1, 2, 3], "description": "Mouse button (default 1)."}),
         );
         act_props.insert(
             "keys".to_string(),
-            json!({"type": "string", "description": "For key: a key spec like \"Return\", \"Escape\", \"ctrl+s\"."}),
+            json!({"type": "string", "description": "Key spec, e.g. \"Return\", \"ctrl+s\"."}),
         );
         act_props.insert(
             "text".to_string(),
-            json!({"type": "string", "description": "For type: the text to enter (max 512 chars). Verify it with expect.text_visible or a title check where the UI allows readback."}),
+            json!({"type": "string", "description": "Text to type (max 512 chars)."}),
         );
         act_props.insert(
             "dx".to_string(),
-            json!({"type": "integer", "description": "For scroll: horizontal steps (default 0)."}),
+            json!({"type": "integer", "description": "Scroll dx (default 0)."}),
         );
         act_props.insert(
             "dy".to_string(),
-            json!({"type": "integer", "description": "For scroll: vertical steps (default 0; positive scrolls down)."}),
+            json!({"type": "integer", "description": "Scroll dy (default 0; + = down)."}),
         );
         for field in ["from_x", "from_y", "to_x", "to_y"] {
             act_props.insert(
                 field.to_string(),
-                json!({"type": "integer", "description": "For drag: window-relative endpoints (raw targeting only)."}),
+                json!({"type": "integer", "description": "Drag endpoint, window-relative (raw only)."}),
             );
         }
         act_props.insert(
             "route".to_string(),
-            json!({"type": "string", "enum": ["local", "agent"], "description": "Grounding route when target is used. With route agent and no agent_answer, the call returns a grounding ticket (status awaiting_agent_answer, no action taken); re-call with agent_answer added."}),
+            json!({"type": "string", "enum": ["local", "agent"], "description": "Grounding route for target. agent without agent_answer returns an awaiting_agent_answer ticket (no action); re-call with it."}),
         );
         act_props.insert(
             "agent_answer".to_string(),
-            json!({"type": "object", "description": "Your grounding answer for the agent route: the element's center in window-relative pixels, plus confidence. Optional bbox {x_min, y_min, x_max, y_max} (window-relative pixels): when given, the broker acts on the bbox centre.", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "confidence": {"type": "number"}, "bbox": {"type": "object", "properties": {"x_min": {"type": "integer"}, "y_min": {"type": "integer"}, "x_max": {"type": "integer"}, "y_max": {"type": "integer"}}, "required": ["x_min", "y_min", "x_max", "y_max"]}}, "required": ["x", "y", "confidence"]}),
+            json!({"type": "object", "description": "Agent-route answer: element center (window-relative px) + confidence; optional bbox {x_min, y_min, x_max, y_max} — broker acts on its centre.", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "confidence": {"type": "number"}, "bbox": {"type": "object", "properties": {"x_min": {"type": "integer"}, "y_min": {"type": "integer"}, "x_max": {"type": "integer"}, "y_max": {"type": "integer"}}, "required": ["x_min", "y_min", "x_max", "y_max"]}}, "required": ["x", "y", "confidence"]}),
         );
         act_props.insert(
             "window_id".to_string(),
-            json!({"type": "integer", "description": "Optional window-identity pin (C4): an X window id from a prior gui.observe result. When given, the broker refuses with seahawk_gui_window_mismatch if the window that resolves at act time is a different one — never a silent re-match by title."}),
+            json!({"type": "integer", "description": "Window pin (C4): X window id from gui.observe; a different resolved window is refused seahawk_gui_window_mismatch."}),
         );
         act_props.insert(
             "expect".to_string(),
-            json!({"type": "object", "description": "The expected effect, verified against a FRESH capture after acting. At least one machine check is required: changed (frame region around the point changed), title_contains (window title contains text), focused (app window holds focus), text_visible (text visibly present, needs the local grounder). description is free text for humans and the op log.", "properties": {"changed": {"type": "boolean"}, "changed_around": {"type": "object", "description": "Anchor the changed diff on this window-relative point (for effects that appear away from the action point, e.g. menus).", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}}, "required": ["x", "y"]}, "full_frame": {"type": "boolean", "description": "Diff the whole frame for the changed check instead of a region around the point."}, "title_contains": {"type": "string"}, "focused": {"type": "boolean"}, "text_visible": {"type": "string"}, "description": {"type": "string"}}}),
+            json!({"type": "object", "description": "Expected effect, verified on a fresh capture after acting; at least one check required (see properties).", "properties": {"changed": {"type": "boolean"}, "changed_around": {"type": "object", "description": "Anchor the changed diff here (for effects away from the action point).", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}}, "required": ["x", "y"]}, "full_frame": {"type": "boolean", "description": "changed: diff the whole frame."}, "title_contains": {"type": "string"}, "focused": {"type": "boolean"}, "text_visible": {"type": "string"}, "description": {"type": "string"}}}),
         );
         let mut act_schema = Map::new();
         act_schema.insert("type".to_string(), json!("object"));
@@ -439,41 +439,19 @@ impl SeahawkServer {
         vec![
             Tool::new(
                 VISION_OBSERVE,
-                "Observe a registered GUI application WITH display geometry (read-class): \
-                 screenshot of the app's window, its rectangle, and the display geometry \
-                 (root resolution, scale factor, virtual-vs-live flag). The frame is \
-                 stored by the broker and referenced by frame_sha256 in the result — \
-                 pass that digest to gui.ground so coordinates stay tied to the exact \
-                 pixels they were read from.",
+                "Observe a registered GUI app WITH display geometry (read-class): window screenshot + rectangle + display geometry (root resolution, scale factor, virtual-vs-live). Frame stored by the broker; the result's frame_sha256 ties later coordinates to those pixels.",
                 Arc::new(observe_schema),
             )
             .with_annotations(read_annotations.clone()),
             Tool::new(
                 VISION_GROUND,
-                "Ground a natural-language target to coordinates in a frame from \
-                 gui.observe (read-class). Returns window-relative x/y, \
-                 display-absolute coordinates, the grounder's confidence, and an \
-                 evidence crop image around the point. Routes: local (the broker's \
-                 configured vision model) or agent (you answer the broker's ticket \
-                 with agent_answer). Grounding is perception only — it grants no \
-                 permission to act; a point below the confidence floor is refused \
-                 with seahawk_gui_ground_failed rather than returned.",
+                "[grounding-class: default-deny — requires policy enablement] Ground a natural-language target in a frame from gui.observe (read-class): window-relative + display-absolute coordinates, confidence, evidence crop. Routes: local (vision model) or agent (answer with agent_answer). Perception only; below the confidence floor refused seahawk_gui_ground_failed.",
                 Arc::new(ground_schema),
             )
             .with_annotations(read_annotations),
             Tool::new(
                 VISION_ACT_VERIFIED,
-                "[actuate-class: default-deny — requires policy enablement of \
-                 gui.<app>.actuate and a per-call operator token] Act on a GUI target \
-                 and VERIFY the effect. Target by description (grounded on a fresh \
-                 capture per attempt) or by raw window-relative coordinates; the \
-                 action runs through the same decide() gate and window confinement \
-                 as gui.<app>.actuate. After acting, the broker captures a fresh \
-                 frame and evaluates the expect checks; on mismatch it re-grounds \
-                 and retries at most 2 times, then refuses with \
-                 seahawk_gui_verify_mismatch — note the action HAS been performed \
-                 in that case; both sides' screenshot hashes are in the op log and \
-                 the refusal's evidence.",
+                "[actuate-class: default-deny — requires gui.<app>.actuate policy + per-call operator token] Act on a GUI target and VERIFY the effect. Target by description (grounded on a fresh capture per attempt) or raw window-relative coordinates; same decide() gate and window confinement as gui.<app>.actuate. expect is checked on a fresh capture; on mismatch, re-ground + retry (max 2), then refuse seahawk_gui_verify_mismatch — the action HAS been performed then (both screenshot hashes in the op log + refusal evidence).",
                 Arc::new(act_schema),
             )
             .with_annotations(
@@ -494,23 +472,23 @@ impl SeahawkServer {
         let mut props = Map::new();
         props.insert(
             "workspace".to_string(),
-            json!({"type": "string", "description": "Absolute path of the engine project workspace. Must be inside a [feedback] project_roots entry in the broker's policy; anything else is refused."}),
+            json!({"type": "string", "description": "Engine workspace (absolute); must be inside a [feedback] project_roots policy entry, else refused."}),
         );
         props.insert(
             "files".to_string(),
-            json!({"type": "array", "items": {"type": "string"}, "description": "Workspace-relative file paths to check (1..=16, per policy [feedback] max_files). Parent-escaping or absolute entries are refused."}),
+            json!({"type": "array", "items": {"type": "string"}, "description": "Workspace-relative files (1..=16, per [feedback] max_files); parent-escaping or absolute refused."}),
         );
         props.insert(
             "checks".to_string(),
-            json!({"type": "array", "items": {"type": "string", "enum": ["diagnostics", "lint", "format"]}, "description": "Which checks to run (default: all three). Diagnostics route to theodolite headless (GDScript: periscope); lint and format route to periscope's diver pipelines."}),
+            json!({"type": "array", "items": {"type": "string", "enum": ["diagnostics", "lint", "format"]}, "description": "Checks to run (default: all). Diagnostics: theodolite headless (GDScript: periscope). Lint/format: periscope diver pipelines."}),
         );
         props.insert(
             "route".to_string(),
-            json!({"type": "string", "enum": ["auto", "theodolite", "periscope"], "description": "Force a tooling route (default auto). A forced route that cannot serve a check is refused with seahawk_tooling_unavailable rather than silently rerouted."}),
+            json!({"type": "string", "enum": ["auto", "theodolite", "periscope"], "description": "Force a route (default auto); an unservable forced route is refused seahawk_tooling_unavailable, never rerouted."}),
         );
         props.insert(
             "include_text".to_string(),
-            json!({"type": "boolean", "description": "Also return the formatter's text for files whose format check reports changed (bounded). Default false: format answers are changed booleans plus the steps that ran."}),
+            json!({"type": "boolean", "description": "Also return formatter text for changed files (bounded). Default false: changed booleans + steps run."}),
         );
         let mut schema = Map::new();
         schema.insert("type".to_string(), json!("object"));
@@ -518,7 +496,7 @@ impl SeahawkServer {
         schema.insert("required".to_string(), json!(["workspace", "files"]));
         Tool::new(
             CODE_FEEDBACK,
-            "Structured code feedback for brokered engine work (read-class, D-230):              per file, LSP diagnostics (theodolite headless route; GDScript via              periscope), lint verdicts and format changed flags (periscope running              diver's own pipelines), plus the file's sha256 and the catalog              provenance the answers came from. Bounded episodes: at most 3 calls              per (workspace, file set) per policy window — the 4th is refused              with seahawk_code_feedback_unresolved and the last counts, so change              strategy instead of grinding. A route that cannot serve a check              answers seahawk_tooling_unavailable; feedback is never assumed clean              and never writes anything.",
+            "Code feedback for brokered engine work (read-class, D-230): per file — LSP diagnostics, lint verdicts, format changed flags (routes in the checks property), sha256, route provenance. Max 3 calls per (workspace, file set) per policy window; the 4th is refused seahawk_code_feedback_unresolved, answering with the last counts. A route that cannot serve a check answers seahawk_tooling_unavailable; never assumed clean, never writes.",
             Arc::new(schema),
         )
         .with_annotations(
@@ -3093,7 +3071,7 @@ fn acquire_schema() -> Map<String, Value> {
     );
     props.insert(
         "work".to_string(),
-        json!({"type": "object", "description": "Work record: slug, title, series, tags, source_url, determination {status, record}, tier_claim. Required for plan / manifest / ingest.", "properties": {"slug": {"type": "string"}, "title": {"type": "string"}, "series": {"type": "string"}, "tags": {"type": "array", "items": {"type": "string"}}, "source_url": {"type": "string"}, "determination": {"type": "object"}, "tier_claim": {"type": "string"}}, "required": ["slug", "title", "source_url", "determination"]}),
+        json!({"type": "object", "description": "Work record (fields in properties). Required for plan/manifest/ingest.", "properties": {"slug": {"type": "string"}, "title": {"type": "string"}, "series": {"type": "string"}, "tags": {"type": "array", "items": {"type": "string"}}, "source_url": {"type": "string"}, "determination": {"type": "object"}, "tier_claim": {"type": "string"}}, "required": ["slug", "title", "source_url", "determination"]}),
     );
     props.insert(
         "slug".to_string(),
@@ -3101,39 +3079,39 @@ fn acquire_schema() -> Map<String, Value> {
     );
     props.insert(
         "transport".to_string(),
-        json!({"type": "string", "enum": ["browser_harness", "seahawk_fetch", "seahawk_gui"], "description": "Capture transport (default browser_harness). seahawk_gui refuses until the S5 benchmark gate is green. seahawk_fetch (D-503) is the fetch action's transport: the broker process itself fetches over HTTPS."}),
+        json!({"type": "string", "enum": ["browser_harness", "seahawk_fetch", "seahawk_gui"], "description": "Transport (default browser_harness). seahawk_gui refuses until S5 green. seahawk_fetch (D-503): the broker fetches HTTPS itself."}),
     );
     props.insert(
         "kind".to_string(),
-        json!({"type": "string", "enum": ["file", "page"], "description": "For fetch: page stores the fetched page as page.html evidence in the work dir (outside the media census); file streams the URL into the media dir under the final URL's file name, the lane caps enforced mid-stream."}),
+        json!({"type": "string", "enum": ["file", "page"], "description": "Fetch kind. page: page.html evidence in the work dir (outside the media census). file: stream into the media dir under the final URL's name, caps enforced mid-stream, partials deleted on breach."}),
     );
     props.insert(
         "url".to_string(),
-        json!({"type": "string", "description": "For fetch: the URL to fetch. Required for kind=file; for kind=page it defaults to the work's source_url. Must be HTTPS on an allowlisted host. Chain rule (D-504): a page chain never leaves the allowlist; a file chain starts allowlisted and may complete on the first non-allowlist host the site's route designates (a hop to a second foreign host, or a cold foreign start, is a typed refusal). Max 5 hops."}),
+        json!({"type": "string", "description": "Fetch URL (HTTPS, allowlisted host). Required for kind=file; page defaults to source_url. Chain (D-504): page chains never leave the allowlist; a file chain may complete on the first site-designated foreign host (recorded site_designated_host + fetch_provenance); second foreign hop or cold foreign start refused. Max 5 hops."}),
     );
     props.insert(
         "mode".to_string(),
-        json!({"type": "string", "enum": ["supervised", "unattended"], "description": "Session mode (default supervised). Unattended refuses until the S5 benchmark gate is green."}),
+        json!({"type": "string", "enum": ["supervised", "unattended"], "description": "Session mode (default supervised); unattended refuses until S5 green."}),
     );
     props.insert(
         "capture_methods".to_string(),
-        json!({"type": "object", "description": "Per-file capture method overrides for manifest: file name -> download | save_as_original | screenshot_derived. Unnamed files default to download."}),
+        json!({"type": "object", "description": "Manifest: per-file capture overrides, name -> download|save_as_original|screenshot_derived (default download)."}),
     );
     props.insert(
         "state".to_string(),
-        json!({"type": "string", "description": "For lifecycle: the extraction lifecycle state to record (e.g. registered, extracted_unverified, verified_complete, failed)."}),
+        json!({"type": "string", "description": "Lifecycle: extraction state to record (e.g. registered, extracted_unverified, verified_complete, failed)."}),
     );
     props.insert(
         "extraction".to_string(),
-        json!({"type": "object", "description": "For lifecycle: extraction evidence {record_count, output_hashes[]} checked at deletion time."}),
+        json!({"type": "object", "description": "Lifecycle: extraction evidence {record_count, output_hashes[]}; re-verified at deletion."}),
     );
     props.insert(
         "hold".to_string(),
-        json!({"type": "string", "description": "For lifecycle: a named hold; held media is never auto-deleted."}),
+        json!({"type": "string", "description": "Lifecycle: named hold; held media is never auto-deleted."}),
     );
     props.insert(
         "dry_run".to_string(),
-        json!({"type": "boolean", "description": "For delete_verified: report only (default true). Real deletion requires dry_run=false."}),
+        json!({"type": "boolean", "description": "delete_verified: report only (default true); false deletes after re-verification."}),
     );
     let mut schema = Map::new();
     schema.insert("type".to_string(), json!("object"));
