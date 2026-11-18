@@ -1,4 +1,7 @@
 # Seahawk
+
+mcp-name: ai.qompass/seahawk
+
 [![crates.io](https://img.shields.io/crates/v/seahawk.svg)](https://crates.io/crates/seahawk)
 
 The estate's authenticated broker for Unreal Engine's built-in MCP
