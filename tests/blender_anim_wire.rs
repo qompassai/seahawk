@@ -274,6 +274,10 @@ fn spawn(scratch: Scratch) -> Session {
         next_id: 0,
         scratch,
     };
+    assert!(
+        session.scratch.config_path().is_file(),
+        "the broker config must exist before the broker starts"
+    );
     session.handshake();
     session
 }
@@ -464,7 +468,11 @@ fn take_validate_is_broker_local() {
     let mock = mock_provider();
     let mut s = spawn(Scratch::new(mock.port));
     let take = valid_take();
-    let response = s.call("blender.take_validate", json!({"take": take.clone()}), false);
+    let response = s.call(
+        "blender.take_validate",
+        json!({"take": take.clone()}),
+        false,
+    );
     let body = structured(&response);
     assert_eq!(body["valid"], true, "{response}");
     assert_eq!(body["kind"], "take");
@@ -486,7 +494,9 @@ fn take_apply_round_trips_with_the_take_intact() {
     let take = valid_take();
     let response = s.call("blender.take_apply", json!({"take": take.clone()}), false);
     assert_eq!(structured(&response)["applied"], true, "{response}");
-    let params = mock.params_of("take_apply").expect("provider saw take_apply");
+    let params = mock
+        .params_of("take_apply")
+        .expect("provider saw take_apply");
     assert_eq!(params["take"]["sha256"], take["sha256"]);
     assert_eq!(params["take"]["id"], "wire-take-1");
 }
@@ -525,11 +535,16 @@ fn take_export_transform_is_computed_broker_side() {
     // The provider received the finished export document, not
     // the take: the transform is the broker's, the write is
     // the provider's.
-    let params = mock.params_of("take_export").expect("provider saw take_export");
+    let params = mock
+        .params_of("take_export")
+        .expect("provider saw take_export");
     assert_eq!(params["export"]["schema"], "seahawk.take-export/v2");
     assert_eq!(params["export"]["take"]["sha256"], take["sha256"]);
     assert_eq!(params["export"]["channels"][0]["target"]["kind"], "bone");
-    assert!(params.get("take").is_none(), "raw take must not ride: {params}");
+    assert!(
+        params.get("take").is_none(),
+        "raw take must not ride: {params}"
+    );
 }
 
 // ---------------------------------------------------------------------------

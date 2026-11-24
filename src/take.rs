@@ -51,19 +51,8 @@ pub const MAX_NAME_CHARS: usize = 256;
 /// carries the interpolation evaluation will read; anything
 /// outside this set is not Blender data and is refused.
 pub const INTERPS: [&str; 13] = [
-    "CONSTANT",
-    "LINEAR",
-    "BEZIER",
-    "SINE",
-    "QUAD",
-    "CUBIC",
-    "QUART",
-    "QUINT",
-    "EXPO",
-    "CIRC",
-    "BACK",
-    "BOUNCE",
-    "ELASTIC",
+    "CONSTANT", "LINEAR", "BEZIER", "SINE", "QUAD", "CUBIC", "QUART", "QUINT", "EXPO", "CIRC",
+    "BACK", "BOUNCE", "ELASTIC",
 ];
 
 /// The interpolations whose evaluation reads a per-key easing
@@ -218,9 +207,7 @@ fn check_created_by(object: &Map<String, Value>, what: &str) -> Result<(), Strin
         match created_by.as_str() {
             Some(text) if text.chars().count() <= MAX_NAME_CHARS => {}
             _ => {
-                return Err(refuse(format!(
-                    "{what}.created_by must be a short string"
-                )));
+                return Err(refuse(format!("{what}.created_by must be a short string")));
             }
         }
     }
@@ -261,21 +248,18 @@ fn check_path(path: &str, what: &str) -> Result<(), String> {
     if PROPS.contains(&path) {
         return Ok(());
     }
-    for (prefix, tail) in [
-        ("pose.bones[\"", None),
-        ("key_blocks[\"", Some(".value")),
-    ] {
-        if let Some(rest) = path.strip_prefix(prefix) {
-            if let Some((name, after)) = rest.split_once("\"]") {
-                if !name.is_empty() && !name.contains('"') {
-                    match tail {
-                        None if PROPS.contains(&after.strip_prefix('.').unwrap_or("")) => {
-                            return Ok(());
-                        }
-                        Some(expected) if after == expected => return Ok(()),
-                        _ => {}
-                    }
+    for (prefix, tail) in [("pose.bones[\"", None), ("key_blocks[\"", Some(".value"))] {
+        if let Some(rest) = path.strip_prefix(prefix)
+            && let Some((name, after)) = rest.split_once("\"]")
+            && !name.is_empty()
+            && !name.contains('"')
+        {
+            match tail {
+                None if PROPS.contains(&after.strip_prefix('.').unwrap_or("")) => {
+                    return Ok(());
                 }
+                Some(expected) if after == expected => return Ok(()),
+                _ => {}
             }
         }
     }
@@ -469,11 +453,7 @@ fn check_key(key: &Value, what: &str) -> Result<f64, String> {
         ],
         what,
     )?;
-    let Some(frame) = key
-        .get("frame")
-        .and_then(Value::as_str)
-        .and_then(decimal6)
-    else {
+    let Some(frame) = key.get("frame").and_then(Value::as_str).and_then(decimal6) else {
         return Err(refuse(format!(
             "{what}.frame must be a 6-decimal string (D2)"
         )));
@@ -518,9 +498,7 @@ fn check_key(key: &Value, what: &str) -> Result<f64, String> {
             }
         }
         _ => {
-            return Err(refuse(format!(
-                "{what}.easing must be null or a string"
-            )));
+            return Err(refuse(format!("{what}.easing must be null or a string")));
         }
     }
     let handle_left = check_handle_pair(key, "handle_left", what)?;
@@ -721,9 +699,9 @@ pub fn validate_take(envelope: &Value) -> Result<TakeInfo, String> {
                 keys.len()
             )));
         }
-        total_keys = total_keys.checked_add(keys.len()).ok_or_else(|| {
-            refuse("take key count overflowed".to_string())
-        })?;
+        total_keys = total_keys
+            .checked_add(keys.len())
+            .ok_or_else(|| refuse("take key count overflowed".to_string()))?;
         if total_keys > MAX_KEYS_TOTAL {
             return Err(refuse(format!(
                 "take carries more than {MAX_KEYS_TOTAL} keys in total \
@@ -848,11 +826,7 @@ pub fn validate_take(envelope: &Value) -> Result<TakeInfo, String> {
     })
 }
 
-fn check_bake(
-    bake: &Value,
-    frames: &Frames,
-    addresses: &HashSet<String>,
-) -> Result<(), String> {
+fn check_bake(bake: &Value, frames: &Frames, addresses: &HashSet<String>) -> Result<(), String> {
     let Some(bake) = bake.as_object() else {
         return Err(refuse("take.bake must be null or an object".to_string()));
     };
@@ -897,7 +871,7 @@ fn check_bake(
                 .to_string(),
         ));
     }
-    let settings_hash = hex(&Sha256::digest(&canonical_bytes(settings)));
+    let settings_hash = hex(&Sha256::digest(canonical_bytes(settings)));
     match bake.get("settings_sha256").and_then(Value::as_str) {
         Some(text) if text == settings_hash => {}
         _ => {
@@ -994,8 +968,7 @@ pub fn validate_pose(envelope: &Value) -> Result<PoseInfo, String> {
     };
     if channels.is_empty() {
         return Err(refuse(
-            "pose.channels must not be empty (a pose with no values poses nothing)"
-                .to_string(),
+            "pose.channels must not be empty (a pose with no values poses nothing)".to_string(),
         ));
     }
     if channels.len() > MAX_POSE_CHANNELS {
@@ -1075,10 +1048,7 @@ fn export_target(channel: &Map<String, Value>) -> Value {
         .unwrap_or("")
         .to_string();
     let (kind, name) = if let Some(rest) = path.strip_prefix("pose.bones[\"") {
-        (
-            "bone",
-            rest.split_once("\"]").map(|(n, _)| n.to_string()),
-        )
+        ("bone", rest.split_once("\"]").map(|(n, _)| n.to_string()))
     } else if let Some(rest) = path.strip_prefix("key_blocks[\"") {
         (
             "shape_key",
@@ -1178,10 +1148,7 @@ pub fn action_digest(envelope: &Value) -> Result<String, String> {
     {
         let channel = channel.as_object().expect("validated channel");
         let id = channel.get("id").expect("validated id");
-        let slot = channel
-            .get("slot")
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let slot = channel.get("slot").and_then(Value::as_str).unwrap_or("");
         lines.push(format!(
             "C|{}|{}|{}|{}|{}|{}",
             id.get("type").and_then(Value::as_str).unwrap_or(""),
@@ -1200,9 +1167,7 @@ pub fn action_digest(envelope: &Value) -> Result<String, String> {
             .expect("validated keys")
         {
             let key = key.as_object().expect("validated key");
-            let text = |field: &str| {
-                key.get(field).and_then(Value::as_str).unwrap_or("")
-            };
+            let text = |field: &str| key.get(field).and_then(Value::as_str).unwrap_or("");
             let pair = |field: &str| match key.get(field) {
                 Some(Value::Array(parts)) if parts.len() == 2 => format!(
                     "{},{}",
@@ -1331,10 +1296,7 @@ mod tests {
             take["channels"][0][field] = value;
             restamp(&mut take);
             let error = validate_take(&take).expect_err("excluded must refuse");
-            assert!(
-                error.contains("excluded construct"),
-                "{field}: {error}"
-            );
+            assert!(error.contains("excluded construct"), "{field}: {error}");
         }
     }
 
@@ -1366,10 +1328,7 @@ mod tests {
 
         let mut take = valid_take();
         let channel = take["channels"][0].clone();
-        take["channels"]
-            .as_array_mut()
-            .unwrap()
-            .push(channel);
+        take["channels"].as_array_mut().unwrap().push(channel);
         restamp(&mut take);
         let error = validate_take(&take).expect_err("duplicate channel must refuse");
         assert!(error.contains("twice"), "{error}");
@@ -1461,7 +1420,7 @@ mod tests {
     fn baked_take_validates_and_bad_bake_refuses() {
         let mut take = valid_take();
         let settings = json!({"quality": 5, "solver": "cloth"});
-        let settings_hash = hex(&Sha256::digest(&canonical_bytes(&settings)));
+        let settings_hash = hex(&Sha256::digest(canonical_bytes(&settings)));
         take["bake"] = json!({
             "system": "HairCloth",
             "blender": "5.3.0",
