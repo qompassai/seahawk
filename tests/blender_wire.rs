@@ -31,19 +31,32 @@ const PROVIDER_SECRET: &str = "provider-secret";
 
 const CORE: [&str; 3] = ["seahawk_oplog", "seahawk_status", "seahawk_surface"];
 
-const BLENDER_TOOLS: [&str; 12] = [
+const BLENDER_TOOLS: [&str; 25] = [
     "blender.artifact_validate",
     "blender.blend_save",
+    "blender.contact_sheet",
+    "blender.curve_apply",
+    "blender.curve_capture",
     "blender.gp_capture",
+    "blender.gp_capture_range",
     "blender.gp_replay",
+    "blender.gp_replay_range",
     "blender.image_export_png",
     "blender.paint_apply",
+    "blender.pose_apply",
+    "blender.pose_capture",
     "blender.proof_render",
     "blender.scene_census",
     "blender.scene_open",
     "blender.session_status",
     "blender.shells_along_flow",
+    "blender.sim_bake",
     "blender.stroke_to_shell",
+    "blender.take_apply",
+    "blender.take_capture",
+    "blender.take_export",
+    "blender.take_render",
+    "blender.take_validate",
 ];
 
 // ---------------------------------------------------------------------------
@@ -424,7 +437,7 @@ fn paint_artifact() -> Value {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn blender_profile_lists_the_twelve_provider_tools() {
+fn blender_profile_lists_the_twenty_five_provider_tools() {
     let mock = mock_provider();
     let mut s = spawn(Scratch::new(Some(mock.port), ""));
     let mut expected: Vec<String> = CORE.iter().map(|n| n.to_string()).collect();

@@ -1226,7 +1226,7 @@ impl SeahawkServer {
                     return Ok(refuse(
                         codes::BLENDER_ARTIFACT_INVALID,
                         &format!(
-                            "GP track references artifact {hash}, which was not                              supplied (refused before downstream contact,                              DESIGN-ANIM §1.3)"
+                            "GP track references artifact {hash}, which was not supplied (refused before downstream contact, DESIGN-ANIM §1.3)"
                         ),
                         Some(class),
                     ));
