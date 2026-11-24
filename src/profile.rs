@@ -35,14 +35,20 @@ use std::fmt;
 /// The valid profile words, in the order error messages list
 /// them: the two whole-surface words, then the packs in
 /// alphabetical order.
-pub const VALID_WORDS: &str = "core, full, acquire, blender, broker, feedback, gui, vision";
+pub const VALID_WORDS: &str =
+    "core, full, acquire, blender, broker, feedback, godot, gui, unity, vision";
 
 /// Broker-core tool names: the standing operator surface. These
 /// belong to no pack and are served under every profile,
 /// including `core` itself. The names mirror the `NATIVE_*`
 /// constants in `server.rs`; the coverage test there pins the
 /// two together over the real tool constructors.
-pub const CORE_TOOLS: [&str; 3] = ["seahawk_oplog", "seahawk_status", "seahawk_surface"];
+pub const CORE_TOOLS: [&str; 4] = [
+    "seahawk_oplog",
+    "seahawk_status",
+    "seahawk_surface",
+    "target.list",
+];
 
 /// The acquisition lane's one native verb (pack `acquire`).
 pub const ACQUIRE_TOOL: &str = "seahawk_acquire";
@@ -72,9 +78,14 @@ pub enum Pack {
     Broker,
     /// The D-230 `code.feedback` tool.
     Feedback,
+    /// The Godot target adapter's tools (`godot.*`).
+    Godot,
     /// Per-app GUI tools from operator policy registrations
-    /// (`gui.<app>.observe`, `gui.<app>.actuate`).
+    /// (`gui.<app>.observe`, `gui.<app>.actuate`) and the
+    /// generic-GUI floor's tools (`gui.floor_*`).
     Gui,
+    /// The Unity target adapter's tools (`unity.*`).
+    Unity,
     /// The S5 broker-level vision tools (`gui.observe`,
     /// `gui.ground`, `gui.act_verified`).
     Vision,
@@ -83,12 +94,14 @@ pub enum Pack {
 impl Pack {
     /// Every pack, alphabetical by name — the canonical order
     /// for listings and for `ToolProfile::spec_string`.
-    pub const ALL: [Pack; 6] = [
+    pub const ALL: [Pack; 8] = [
         Pack::Acquire,
         Pack::Blender,
         Pack::Broker,
         Pack::Feedback,
+        Pack::Godot,
         Pack::Gui,
+        Pack::Unity,
         Pack::Vision,
     ];
 
@@ -99,7 +112,9 @@ impl Pack {
             Pack::Blender => "blender",
             Pack::Broker => "broker",
             Pack::Feedback => "feedback",
+            Pack::Godot => "godot",
             Pack::Gui => "gui",
+            Pack::Unity => "unity",
             Pack::Vision => "vision",
         }
     }
@@ -240,6 +255,12 @@ impl ToolProfile {
         if tool_name.len() >= 8 && tool_name[..8].eq_ignore_ascii_case("blender.") {
             return Some(Pack::Blender);
         }
+        if tool_name.len() >= 6 && tool_name[..6].eq_ignore_ascii_case("unity.") {
+            return Some(Pack::Unity);
+        }
+        if tool_name.len() >= 6 && tool_name[..6].eq_ignore_ascii_case("godot.") {
+            return Some(Pack::Godot);
+        }
         if VISION_TOOLS
             .iter()
             .any(|name| name.eq_ignore_ascii_case(tool_name))
@@ -371,12 +392,14 @@ mod tests {
 
     #[test]
     fn each_pack_serves_exactly_its_family_plus_core() {
-        let cases: [(&str, &str, &str); 6] = [
+        let cases: [(&str, &str, &str); 8] = [
             ("acquire", ACQUIRE_TOOL, FEEDBACK_TOOL),
             ("blender", "blender.paint_apply", "gui.observe"),
             ("broker", "EditorToolset.X.Y", ACQUIRE_TOOL),
             ("feedback", FEEDBACK_TOOL, "gui.observe"),
+            ("godot", "godot.run_script", "unity.status"),
             ("gui", "gui.blender.actuate", "gui.observe"),
+            ("unity", "unity.run_method", "godot.status"),
             ("vision", "gui.act_verified", "gui.blender.actuate"),
         ];
         for (spec, served, withheld) in cases {
@@ -398,6 +421,13 @@ mod tests {
         assert_eq!(ToolProfile::pack_of("GUI.OBSERVE"), Some(Pack::Vision));
         assert_eq!(ToolProfile::pack_of("SeaHawk_Status"), None);
         assert_eq!(ToolProfile::pack_of("GUI.Blender.Actuate"), Some(Pack::Gui));
+        assert_eq!(ToolProfile::pack_of("UNITY.RUN_METHOD"), Some(Pack::Unity));
+        assert_eq!(ToolProfile::pack_of("Godot.Inspect"), Some(Pack::Godot));
+        // target.list is broker core: always served, no pack.
+        assert_eq!(ToolProfile::pack_of("target.list"), None);
+        assert_eq!(ToolProfile::pack_of("TARGET.LIST"), None);
+        // The floor's tools ride the gui family.
+        assert_eq!(ToolProfile::pack_of("gui.floor_act"), Some(Pack::Gui));
     }
 
     // -- adversarial: malformed specs fail closed ----------------

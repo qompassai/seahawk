@@ -76,6 +76,12 @@ struct RawConfig {
     #[serde(default)]
     blender: Option<RawBlender>,
     #[serde(default)]
+    unity: Option<RawUnity>,
+    #[serde(default)]
+    godot: Option<RawGodot>,
+    #[serde(default)]
+    floor: Option<RawFloor>,
+    #[serde(default)]
     oplog: RawOplog,
 }
 
@@ -136,6 +142,93 @@ pub struct BlenderConfig {
     pub render_roots: Vec<PathBuf>,
 }
 
+/// The Unity adapter's section (generalization, 2026-11-24).
+/// Optional: without it the `unity.*` tools are not listed and
+/// the target registry reports the adapter as not configured.
+/// The adapter drives the estate's proven route — the `unity`
+/// CLI for inventory and Editor batchmode for method runs.
+#[derive(Debug, Deserialize)]
+struct RawUnity {
+    #[serde(default = "default_unity_cli")]
+    cli_path: String,
+    #[serde(default = "default_unity_timeout")]
+    timeout_secs: u64,
+}
+
+fn default_unity_cli() -> String {
+    // Resolved on PATH; the estate's install is
+    // ~/.local/bin/unity (custom.unity connector).
+    "unity".to_string()
+}
+
+fn default_unity_timeout() -> u64 {
+    // Editor batchmode runs are minutes-scale; the runner
+    // still bounds every run.
+    1200
+}
+
+/// Validated Unity adapter configuration.
+#[derive(Clone, Debug)]
+pub struct UnityConfig {
+    pub cli_path: PathBuf,
+    /// Bound for one Editor batchmode run, in seconds.
+    pub timeout_secs: u64,
+}
+
+/// The Godot adapter's section (generalization, 2026-11-24).
+/// Optional, like `[unity]`.
+#[derive(Debug, Deserialize)]
+struct RawGodot {
+    #[serde(default = "default_godot_binary")]
+    binary: String,
+    #[serde(default = "default_godot_timeout")]
+    timeout_secs: u64,
+}
+
+fn default_godot_binary() -> String {
+    // The distro install on primo (4.7.2.stable at commission
+    // time).
+    "/usr/bin/godot".to_string()
+}
+
+fn default_godot_timeout() -> u64 {
+    120
+}
+
+/// Validated Godot adapter configuration.
+#[derive(Clone, Debug)]
+pub struct GodotConfig {
+    pub binary: PathBuf,
+    /// Bound for one headless script run, in seconds.
+    pub timeout_secs: u64,
+}
+
+/// The generic-GUI floor's section (generalization,
+/// 2026-11-24). Optional: without it the `gui.floor_*` tools
+/// are not listed. The floor addresses the host's live Wayland
+/// session through hyprctl, grim, and ydotool.
+#[derive(Debug, Deserialize)]
+struct RawFloor {
+    #[serde(default = "default_ydotool_socket")]
+    ydotool_socket: String,
+    #[serde(default)]
+    runtime_dir: Option<String>,
+}
+
+fn default_ydotool_socket() -> String {
+    // The estate's proven ydotool route on primo (TOOLS.md).
+    "/run/user/1000/.ydotool_socket".to_string()
+}
+
+/// Validated generic-GUI floor configuration.
+#[derive(Clone, Debug)]
+pub struct FloorConfig {
+    pub ydotool_socket: PathBuf,
+    /// The session's XDG_RUNTIME_DIR, when the operator pins
+    /// it; otherwise resolved at call time.
+    pub runtime_dir: Option<PathBuf>,
+}
+
 /// Which root list a blender file op is checked against.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlenderRoot {
@@ -173,8 +266,10 @@ impl BlenderConfig {
 
 /// Lexically normalizes a path: must be absolute; `.` drops,
 /// `..` pops (refusing — `None` — when it would pop past the
-/// root, i.e. the path escapes upward out of itself).
-fn normalize_path(path: &Path) -> Option<PathBuf> {
+/// root, i.e. the path escapes upward out of itself). Shared
+/// with the target adapters (the Godot adapter holds scripts
+/// inside their project with it).
+pub(crate) fn normalize_path(path: &Path) -> Option<PathBuf> {
     use std::path::Component;
     if !path.is_absolute() {
         return None;
@@ -502,6 +597,15 @@ pub struct Config {
     /// Blender stroke provider configuration, when the
     /// operator configured a `[blender]` downstream.
     pub blender: Option<BlenderConfig>,
+    /// Unity adapter configuration, when the operator
+    /// configured a `[unity]` section.
+    pub unity: Option<UnityConfig>,
+    /// Godot adapter configuration, when the operator
+    /// configured a `[godot]` section.
+    pub godot: Option<GodotConfig>,
+    /// Generic-GUI floor configuration, when the operator
+    /// configured a `[floor]` section.
+    pub floor: Option<FloorConfig>,
     pub oplog_path: PathBuf,
 }
 
@@ -587,6 +691,18 @@ impl Config {
             Some(raw_blender) => Some(parse_blender(raw_blender)?),
             None => None,
         };
+        let unity = match &raw.unity {
+            Some(raw_unity) => Some(parse_unity(raw_unity)?),
+            None => None,
+        };
+        let godot = match &raw.godot {
+            Some(raw_godot) => Some(parse_godot(raw_godot)?),
+            None => None,
+        };
+        let floor = match &raw.floor {
+            Some(raw_floor) => Some(parse_floor(raw_floor)?),
+            None => None,
+        };
         let gui_apps = parse_gui_apps(&raw.gui)?;
         let vision = parse_vision(&raw.vision)?;
         let tooling = parse_tooling(&raw.tooling)?;
@@ -632,6 +748,9 @@ impl Config {
             feedback,
             acquisition,
             blender,
+            unity,
+            godot,
+            floor,
             oplog_path: raw.oplog.path,
         })
     }
@@ -651,6 +770,43 @@ impl Config {
     /// outside the provider surface.
     pub fn blender_class_of(&self, tool_name: &str) -> Option<ToolClass> {
         let table = crate::model::blender_class(tool_name)?;
+        let raised = self
+            .class_overrides
+            .get(&tool_name.to_lowercase())
+            .copied()
+            .filter(|override_class| override_class.rank() > table.rank());
+        Some(raised.unwrap_or(table))
+    }
+
+    /// The class of a `unity.*` tool: the compiled-in adapter
+    /// table, raised (never lowered) by any configured
+    /// override — the `blender_class_of` discipline.
+    pub fn unity_class_of(&self, tool_name: &str) -> Option<ToolClass> {
+        let table = crate::model::unity_class(tool_name)?;
+        let raised = self
+            .class_overrides
+            .get(&tool_name.to_lowercase())
+            .copied()
+            .filter(|override_class| override_class.rank() > table.rank());
+        Some(raised.unwrap_or(table))
+    }
+
+    /// The class of a `godot.*` tool (`unity_class_of`'s
+    /// discipline over the Godot table).
+    pub fn godot_class_of(&self, tool_name: &str) -> Option<ToolClass> {
+        let table = crate::model::godot_class(tool_name)?;
+        let raised = self
+            .class_overrides
+            .get(&tool_name.to_lowercase())
+            .copied()
+            .filter(|override_class| override_class.rank() > table.rank());
+        Some(raised.unwrap_or(table))
+    }
+
+    /// The class of a `gui.floor_*` tool (`unity_class_of`'s
+    /// discipline over the floor table).
+    pub fn floor_class_of(&self, tool_name: &str) -> Option<ToolClass> {
+        let table = crate::model::floor_class(tool_name)?;
         let raised = self
             .class_overrides
             .get(&tool_name.to_lowercase())
@@ -826,6 +982,61 @@ fn parse_blender(raw: &RawBlender) -> anyhow::Result<BlenderConfig> {
     })
 }
 
+fn parse_unity(raw: &RawUnity) -> anyhow::Result<UnityConfig> {
+    let cli_path = raw.cli_path.trim();
+    if cli_path.is_empty() {
+        bail!("config: unity.cli_path must not be empty");
+    }
+    if raw.timeout_secs == 0 || raw.timeout_secs > MAX_DOWNSTREAM_TIMEOUT_SECS {
+        bail!(
+            "config: unity.timeout_secs {} outside 1..={MAX_DOWNSTREAM_TIMEOUT_SECS}",
+            raw.timeout_secs
+        );
+    }
+    Ok(UnityConfig {
+        cli_path: PathBuf::from(cli_path),
+        timeout_secs: raw.timeout_secs,
+    })
+}
+
+fn parse_godot(raw: &RawGodot) -> anyhow::Result<GodotConfig> {
+    let binary = raw.binary.trim();
+    if binary.is_empty() {
+        bail!("config: godot.binary must not be empty");
+    }
+    if raw.timeout_secs == 0 || raw.timeout_secs > MAX_DOWNSTREAM_TIMEOUT_SECS {
+        bail!(
+            "config: godot.timeout_secs {} outside 1..={MAX_DOWNSTREAM_TIMEOUT_SECS}",
+            raw.timeout_secs
+        );
+    }
+    Ok(GodotConfig {
+        binary: PathBuf::from(binary),
+        timeout_secs: raw.timeout_secs,
+    })
+}
+
+fn parse_floor(raw: &RawFloor) -> anyhow::Result<FloorConfig> {
+    let socket = raw.ydotool_socket.trim();
+    if socket.is_empty() || !Path::new(socket).is_absolute() {
+        bail!("config: floor.ydotool_socket must be an absolute path, got {socket:?}");
+    }
+    let runtime_dir = match &raw.runtime_dir {
+        Some(dir) => {
+            let dir = dir.trim();
+            if dir.is_empty() || !Path::new(dir).is_absolute() {
+                bail!("config: floor.runtime_dir must be an absolute path, got {dir:?}");
+            }
+            Some(PathBuf::from(dir))
+        }
+        None => None,
+    };
+    Ok(FloorConfig {
+        ydotool_socket: PathBuf::from(socket),
+        runtime_dir,
+    })
+}
+
 fn parse_feedback(raw: &RawFeedback) -> anyhow::Result<FeedbackConfig> {
     let mut feedback = FeedbackConfig::default();
     if let Some(max_files) = raw.max_files {
@@ -975,6 +1186,59 @@ mod tests {
         assert_eq!(cfg.downstream_timeout_secs, 120);
         assert!(cfg.operator_token_digest.is_none());
         assert!(!cfg.require_token_for_list);
+        // No adapter sections: no adapters configured.
+        assert!(cfg.unity.is_none());
+        assert!(cfg.godot.is_none());
+        assert!(cfg.floor.is_none());
+    }
+
+    #[test]
+    fn adapter_sections_parse_with_defaults_and_bounds() {
+        let text = "[server]\nagent_token = \"x\"\n\
+                    [unity]\n\
+                    [godot]\n\
+                    [floor]\n";
+        let cfg = Config::parse(text).expect("adapter sections");
+        let unity = cfg.unity.as_ref().expect("unity configured");
+        assert_eq!(unity.cli_path, PathBuf::from("unity"));
+        assert_eq!(unity.timeout_secs, 1200);
+        let godot = cfg.godot.as_ref().expect("godot configured");
+        assert_eq!(godot.binary, PathBuf::from("/usr/bin/godot"));
+        assert_eq!(godot.timeout_secs, 120);
+        let floor = cfg.floor.as_ref().expect("floor configured");
+        assert_eq!(
+            floor.ydotool_socket,
+            PathBuf::from("/run/user/1000/.ydotool_socket")
+        );
+        assert!(floor.runtime_dir.is_none());
+        // Adapter classes resolve through the same raise-only
+        // override discipline as blender's.
+        assert_eq!(
+            cfg.unity_class_of("unity.run_method"),
+            Some(ToolClass::Execute)
+        );
+        assert_eq!(cfg.godot_class_of("godot.status"), Some(ToolClass::Read));
+        assert_eq!(
+            cfg.floor_class_of("gui.floor_act"),
+            Some(ToolClass::Actuate)
+        );
+        assert_eq!(cfg.unity_class_of("unity.eval"), None);
+    }
+
+    // -- adversarial: adapter sections fail closed -------------
+
+    #[test]
+    fn adapter_sections_refuse_bad_bounds() {
+        for section in [
+            "[unity]\ntimeout_secs = 0\n",
+            "[unity]\ntimeout_secs = 99999\n",
+            "[godot]\ntimeout_secs = 0\n",
+            "[floor]\nydotool_socket = \"relative.sock\"\n",
+            "[floor]\nruntime_dir = \"relative/dir\"\n",
+        ] {
+            let text = format!("[server]\nagent_token = \"x\"\n{section}");
+            assert!(Config::parse(&text).is_err(), "{section}");
+        }
     }
 
     #[test]

@@ -48,19 +48,35 @@
 //! itself fetches over HTTPS (the verb's `fetch` action) under
 //! the same decide() gate and caps, for deployments whose host
 //! carries no refused fetch route.
+//!
+//! The generalization (2026-11-24, `target` module) puts every
+//! automation target behind one adapter trait with a declared
+//! capability set: the brokered Unreal downstream and the
+//! Blender provider refit onto it unchanged, and three targets
+//! are new — Unity (Editor batchmode + the unity CLI), Godot
+//! (headless script execution), and a generic-GUI floor for
+//! applications with no scripting API (Wayland window
+//! discovery, grim screenshots, ydotool input). `target.list`
+//! reports every adapter's declaration; per-target tools keep
+//! the estate's class + decide() discipline.
 
 pub mod acquisition;
 pub mod blender;
 pub mod config;
 pub mod downstream;
+pub mod floor;
+pub mod godot;
 pub mod guard;
 pub mod gui;
 pub mod model;
 pub mod oplog;
 pub mod policy;
 pub mod profile;
+pub mod runner;
 pub mod server;
 pub mod stroke;
 pub mod take;
+pub mod target;
 pub mod tooling;
+pub mod unity;
 pub mod vision;

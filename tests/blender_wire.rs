@@ -29,7 +29,12 @@ const AGENT_TOKEN: &str = "agent-secret";
 const OPERATOR_TOKEN: &str = "operator-secret";
 const PROVIDER_SECRET: &str = "provider-secret";
 
-const CORE: [&str; 3] = ["seahawk_oplog", "seahawk_status", "seahawk_surface"];
+const CORE: [&str; 4] = [
+    "seahawk_oplog",
+    "seahawk_status",
+    "seahawk_surface",
+    "target.list",
+];
 
 const BLENDER_TOOLS: [&str; 25] = [
     "blender.artifact_validate",

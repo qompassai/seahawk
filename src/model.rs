@@ -191,6 +191,82 @@ pub fn blender_tool_names() -> Vec<&'static str> {
     BLENDER_CLASSES.iter().map(|(name, _)| *name).collect()
 }
 
+/// The Unity adapter's class table (generalization, 2026-11-24):
+/// the four `unity.*` tools. Like the Blender table there is no
+/// census — the adapter is authored by the estate, so this
+/// table *is* the surface definition. Classification follows
+/// reach: status/projects/inspect observe, and `run_method`
+/// executes project code inside an Editor, so it is
+/// execute-class and carries the two-key rule.
+pub const UNITY_CLASSES: [(&str, ToolClass); 4] = [
+    ("unity.status", ToolClass::Read),
+    ("unity.projects", ToolClass::Read),
+    ("unity.inspect", ToolClass::Read),
+    ("unity.run_method", ToolClass::Execute),
+];
+
+/// The compiled-in class of a `unity.*` tool (case-insensitive).
+pub fn unity_class(tool_name: &str) -> Option<ToolClass> {
+    UNITY_CLASSES
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(tool_name))
+        .map(|(_, class)| *class)
+}
+
+/// The canonical names of the four Unity tools, in table order.
+pub fn unity_tool_names() -> Vec<&'static str> {
+    UNITY_CLASSES.iter().map(|(name, _)| *name).collect()
+}
+
+/// The Godot adapter's class table (generalization,
+/// 2026-11-24): the three `godot.*` tools, estate-authored
+/// like the Unity table. `run_script` executes project code in
+/// the engine, so it is execute-class.
+pub const GODOT_CLASSES: [(&str, ToolClass); 3] = [
+    ("godot.status", ToolClass::Read),
+    ("godot.inspect", ToolClass::Read),
+    ("godot.run_script", ToolClass::Execute),
+];
+
+/// The compiled-in class of a `godot.*` tool (case-insensitive).
+pub fn godot_class(tool_name: &str) -> Option<ToolClass> {
+    GODOT_CLASSES
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(tool_name))
+        .map(|(_, class)| *class)
+}
+
+/// The canonical names of the three Godot tools, in table
+/// order.
+pub fn godot_tool_names() -> Vec<&'static str> {
+    GODOT_CLASSES.iter().map(|(name, _)| *name).collect()
+}
+
+/// The generic-GUI floor's class table (generalization,
+/// 2026-11-24): the three `gui.floor_*` tools. Window lists and
+/// screenshots observe (read); injected input is actuate-class
+/// and carries the two-key rule, exactly like the per-app
+/// `gui.<app>.actuate` tools.
+pub const FLOOR_CLASSES: [(&str, ToolClass); 3] = [
+    ("gui.floor_windows", ToolClass::Read),
+    ("gui.floor_screenshot", ToolClass::Read),
+    ("gui.floor_act", ToolClass::Actuate),
+];
+
+/// The compiled-in class of a floor tool (case-insensitive).
+pub fn floor_class(tool_name: &str) -> Option<ToolClass> {
+    FLOOR_CLASSES
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(tool_name))
+        .map(|(_, class)| *class)
+}
+
+/// The canonical names of the three floor tools, in table
+/// order.
+pub fn floor_tool_names() -> Vec<&'static str> {
+    FLOOR_CLASSES.iter().map(|(name, _)| *name).collect()
+}
+
 /// One brokered tool as discovered downstream, with its class
 /// already decided (policy overrides applied at surface build).
 #[derive(Clone, Debug)]
@@ -309,6 +385,30 @@ mod tests {
         assert_eq!(blender_class("BLENDER.PAINT_APPLY"), Some(ToolClass::Write));
         assert_eq!(blender_class("blender.nope"), None);
         assert_eq!(blender_class("gui.blender.actuate"), None);
+    }
+
+    #[test]
+    fn target_adapter_class_tables_match_their_surfaces() {
+        // Generalization (2026-11-24): the estate-authored
+        // adapter tables. Execution verbs are execute-class;
+        // the floor's input verb is actuate; nothing else in
+        // these tables mutates.
+        assert_eq!(UNITY_CLASSES.len(), 4);
+        assert_eq!(unity_class("unity.run_method"), Some(ToolClass::Execute));
+        assert_eq!(unity_class("UNITY.STATUS"), Some(ToolClass::Read));
+        assert_eq!(unity_class("unity.eval"), None);
+        assert_eq!(unity_tool_names().len(), 4);
+        assert_eq!(GODOT_CLASSES.len(), 3);
+        assert_eq!(godot_class("godot.run_script"), Some(ToolClass::Execute));
+        assert_eq!(godot_class("godot.inspect"), Some(ToolClass::Read));
+        assert_eq!(godot_class("godot.nope"), None);
+        assert_eq!(FLOOR_CLASSES.len(), 3);
+        assert_eq!(floor_class("gui.floor_act"), Some(ToolClass::Actuate));
+        assert_eq!(floor_class("gui.floor_windows"), Some(ToolClass::Read));
+        assert_eq!(floor_class("gui.floor_screenshot"), Some(ToolClass::Read));
+        // The floor table must not swallow per-app GUI tools.
+        assert_eq!(floor_class("gui.blender.actuate"), None);
+        assert_eq!(floor_tool_names().len(), 3);
     }
 
     #[test]

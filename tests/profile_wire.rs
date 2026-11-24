@@ -23,7 +23,12 @@ use serde_json::{Value, json};
 const AGENT_TOKEN: &str = "agent-secret";
 const OPERATOR_TOKEN: &str = "operator-secret";
 
-const CORE: [&str; 3] = ["seahawk_oplog", "seahawk_status", "seahawk_surface"];
+const CORE: [&str; 4] = [
+    "seahawk_oplog",
+    "seahawk_status",
+    "seahawk_surface",
+    "target.list",
+];
 
 struct Scratch {
     dir: PathBuf,
@@ -408,7 +413,8 @@ fn assert_startup_refused(
         "stderr names the failure: {stderr}"
     );
     assert!(
-        stderr.contains("core, full, acquire, blender, broker, feedback, gui, vision"),
+        stderr
+            .contains("core, full, acquire, blender, broker, feedback, godot, gui, unity, vision"),
         "stderr lists the valid packs: {stderr}"
     );
 }

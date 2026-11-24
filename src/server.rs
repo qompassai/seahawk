@@ -27,12 +27,18 @@ use crate::acquisition::{self, Mode, Transport, WorkRecord};
 use crate::blender::BlenderClient;
 use crate::config::{BlenderRoot, Config, ToolingId, VisionRoute};
 use crate::downstream::Downstream;
+use crate::floor::GuiFloorAdapter;
+use crate::godot::GodotAdapter;
 use crate::gui::WindowInfo;
 use crate::gui::{ActuateOutcome, Capture, Frame, Gui, GuiError, ObserveOutcome};
 use crate::model::{GuiApp, Surface, ToolClass, ToolRecord};
 use crate::oplog::{LogExtra, OpLog};
 use crate::policy::{self, Decision, ToolKnowledge, codes, token_matches};
+use crate::target::{
+    BlenderAdapter, TargetAdapter, TargetError, TargetRegistry, TargetResult, UnrealAdapter,
+};
 use crate::tooling::{self, CheckKind, Route, ToolingPool};
+use crate::unity::UnityAdapter;
 use crate::vision::{
     self, CheckOutcome, Expectation, FrameStore, GroundHit, Grounder, OllamaGrounder, RawGrounding,
     StoredFrame,
@@ -46,6 +52,12 @@ const NATIVE_OPLOG: &str = "seahawk_oplog";
 /// Acquisition lane verb (D-246/D-248): one tool, action-selected,
 /// so the lane fits the D-247 native token cap.
 const ACQUIRE_TOOL: &str = "seahawk_acquire";
+
+/// Target-adapter declarations (generalization, 2026-11-24):
+/// every adapter's identity, depth, and capability declaration,
+/// with last-known attach states. Broker core like the other
+/// `seahawk_*` natives (see `profile::CORE_TOOLS`).
+const TARGET_LIST: &str = "target.list";
 
 /// S5 broker-level vision tools (the `gui.` namespace, but not
 /// per-app: the app is an argument, validated against the same
@@ -238,6 +250,20 @@ pub struct SeahawkServer {
     /// The Blender stroke provider's downstream client, when a
     /// `[blender]` section is configured (DESIGN §1).
     blender: Option<Arc<BlenderClient>>,
+    /// The declared target adapters (generalization,
+    /// 2026-11-24): Unreal and Blender refit onto the core,
+    /// plus Unity, Godot, and the generic-GUI floor when
+    /// configured. `target.list` reports this registry.
+    targets: Arc<TargetRegistry>,
+    /// The Unity adapter, when a `[unity]` section is
+    /// configured.
+    unity: Option<Arc<UnityAdapter>>,
+    /// The Godot adapter, when a `[godot]` section is
+    /// configured.
+    godot: Option<Arc<GodotAdapter>>,
+    /// The generic-GUI floor adapter, when a `[floor]` section
+    /// is configured.
+    floor: Option<Arc<GuiFloorAdapter>>,
     /// D-230 wiring: the tooling clients (worker-thread owned).
     tooling: Arc<ToolingPool>,
     /// D-230 wiring: feedback episodes + catalog snapshot.
@@ -269,11 +295,48 @@ impl SeahawkServer {
                 }
             }
         });
+        // Target adapters (generalization): Unreal is always
+        // declared (it is the downstream itself); Blender joins
+        // when its provider client exists; Unity, Godot, and
+        // the floor join when configured.
+        let unity = config
+            .unity
+            .clone()
+            .map(|unity_config| Arc::new(UnityAdapter::new(unity_config)));
+        let godot = config
+            .godot
+            .clone()
+            .map(|godot_config| Arc::new(GodotAdapter::new(godot_config)));
+        let floor = config
+            .floor
+            .clone()
+            .map(|floor_config| Arc::new(GuiFloorAdapter::new(floor_config)));
+        let mut adapters: Vec<Arc<dyn TargetAdapter>> = vec![Arc::new(UnrealAdapter::new(
+            downstream.clone(),
+            config.clone(),
+        ))];
+        if let Some(client) = &blender {
+            adapters.push(Arc::new(BlenderAdapter::new(client.clone())));
+        }
+        if let Some(adapter) = &unity {
+            adapters.push(adapter.clone() as Arc<dyn TargetAdapter>);
+        }
+        if let Some(adapter) = &godot {
+            adapters.push(adapter.clone() as Arc<dyn TargetAdapter>);
+        }
+        if let Some(adapter) = &floor {
+            adapters.push(adapter.clone() as Arc<dyn TargetAdapter>);
+        }
+        let targets = Arc::new(TargetRegistry::new(adapters));
         Self {
             config,
             downstream,
             oplog,
             blender,
+            targets,
+            unity,
+            godot,
+            floor,
             gui: Arc::new(Gui::x11()),
             vision: Arc::new(VisionState {
                 frames: Mutex::new(FrameStore::new()),
@@ -327,6 +390,17 @@ impl SeahawkServer {
                 NATIVE_OPLOG,
                 "Recent op-log entries (read-class): tool, class, args digest, outcome, latency. Digests only — raw argument values are never logged.",
                 Arc::new(oplog_schema),
+            )
+            .with_annotations(annotations.clone()),
+            Tool::new(
+                TARGET_LIST,
+                "Target adapter declarations (read-class): every automation target this broker can drive — Unreal, Blender, Unity, Godot, and the generic-GUI floor when configured — with its depth (scripted-deep vs generic-floor), its declared capabilities, and its last-known attach state (null = never probed; listing never probes). An operation outside a target's declaration refuses seahawk_target_capability before the target is touched.",
+                Arc::new({
+                    let mut schema = Map::new();
+                    schema.insert("type".to_string(), json!("object"));
+                    schema.insert("properties".to_string(), Value::Object(Map::new()));
+                    schema
+                }),
             )
             .with_annotations(annotations),
             Tool::new(
@@ -1355,6 +1429,312 @@ impl SeahawkServer {
         }
     }
 
+    /// The Unity adapter's tools (generalization, 2026-11-24),
+    /// listed only when a `[unity]` section is configured — an
+    /// adapter is a deployment, not a default (the Blender
+    /// precedent).
+    fn unity_tools() -> Vec<Tool> {
+        let project_prop = json!({"type": "string", "description": "Absolute Unity project path."});
+        adapter_toolset(
+            vec![
+                (
+                    "unity.status",
+                    "Unity adapter status (read-class): unity CLI version, installed Editor versions, connected Editors.",
+                    object_schema(vec![], &[]),
+                ),
+                (
+                    "unity.projects",
+                    "The Unity Hub project list, as the unity CLI reports it (read-class).",
+                    object_schema(vec![], &[]),
+                ),
+                (
+                    "unity.inspect",
+                    "Inspect one Unity project (read-class): its declared Editor version, the Editor binary that serves it, and the scene census under Assets.",
+                    object_schema(vec![("project", project_prop.clone())], &["project"]),
+                ),
+                (
+                    "unity.run_method",
+                    "Run one public static Editor method in batchmode and return the Editor log tail with the exit code. Judge the run by its log and declared outputs first: on this host an Editor that finished its work can still crash in its own shutdown path. The CLI's command/eval verbs are deliberately not wrapped.",
+                    object_schema(
+                        vec![
+                            ("project", project_prop),
+                            (
+                                "method",
+                                json!({"type": "string", "description": "Dotted method path (Class.Method); identifier characters and dots only — anything else refuses before an Editor starts."}),
+                            ),
+                            (
+                                "log_file",
+                                json!({"type": "string", "description": "Optional Editor log path (default: <project>/seahawk-run.log)."}),
+                            ),
+                        ],
+                        &["project", "method"],
+                    ),
+                ),
+            ],
+            crate::model::unity_class,
+        )
+    }
+
+    /// The Godot adapter's tools (generalization, 2026-11-24),
+    /// listed only when a `[godot]` section is configured.
+    fn godot_tools() -> Vec<Tool> {
+        let project_prop = json!({"type": "string", "description": "Absolute Godot project path (the directory holding project.godot)."});
+        adapter_toolset(
+            vec![
+                (
+                    "godot.status",
+                    "Godot adapter status (read-class): the configured binary and the engine version it reports.",
+                    object_schema(vec![], &[]),
+                ),
+                (
+                    "godot.inspect",
+                    "Inspect one Godot project (read-class): name, main scene, and feature set from project.godot, plus a bounded scene/script census. Without a project argument, answers godot.status.",
+                    object_schema(vec![("project", project_prop.clone())], &[]),
+                ),
+                (
+                    "godot.run_script",
+                    "Run one GDScript (extends SceneTree or MainLoop) headless inside its project and return its stdout/stderr tails with the exit code. The script must live inside the project: a path escaping the project refuses before the engine starts.",
+                    object_schema(
+                        vec![
+                            ("project", project_prop),
+                            (
+                                "script",
+                                json!({"type": "string", "description": "The .gd script to run, absolute or project-relative."}),
+                            ),
+                        ],
+                        &["project", "script"],
+                    ),
+                ),
+            ],
+            crate::model::godot_class,
+        )
+    }
+
+    /// The generic-GUI floor's tools (generalization,
+    /// 2026-11-24), listed only when a `[floor]` section is
+    /// configured. The floor serves applications with no
+    /// scripting API; its declaration (target.list) states its
+    /// limits: no execution, no state beyond what the window
+    /// list and screenshots show.
+    fn floor_tools() -> Vec<Tool> {
+        adapter_toolset(
+            vec![
+                (
+                    "gui.floor_windows",
+                    "Generic-GUI floor: the Wayland session's window list (read-class) — address, class, title, workspace, geometry, focus, from hyprctl. For applications with no scripting API.",
+                    object_schema(vec![], &[]),
+                ),
+                (
+                    "gui.floor_screenshot",
+                    "Generic-GUI floor: a screenshot of the whole session, or of one window's rectangle when address is given (read-class). Returns the PNG as an image block with its SHA-256.",
+                    object_schema(
+                        vec![(
+                            "address",
+                            json!({"type": "string", "description": "Optional window address from gui.floor_windows."}),
+                        )],
+                        &[],
+                    ),
+                ),
+                (
+                    "gui.floor_act",
+                    "Generic-GUI floor: inject one input action with ydotool. Vocabulary: focus (click a window's centre by address), click / double_click (absolute x/y), key (ydotool key tokens), type (text). No scroll and no drag at the floor, by declaration.",
+                    object_schema(
+                        vec![
+                            (
+                                "action",
+                                json!({"type": "string", "enum": ["focus", "click", "double_click", "key", "type"], "description": "The input action."}),
+                            ),
+                            (
+                                "address",
+                                json!({"type": "string", "description": "Window address (focus)."}),
+                            ),
+                            (
+                                "x",
+                                json!({"type": "integer", "description": "Absolute session x (click, double_click)."}),
+                            ),
+                            (
+                                "y",
+                                json!({"type": "integer", "description": "Absolute session y (click, double_click)."}),
+                            ),
+                            (
+                                "keys",
+                                json!({"type": "string", "description": "ydotool keycodes in <keycode>:<pressed> form, whitespace-separated (key). Raw keycodes only: this ydotool build silently ignores symbolic names, so they refuse seahawk_bad_arguments. Example: \"28:1 28:0\" is Enter."}),
+                            ),
+                            (
+                                "text",
+                                json!({"type": "string", "description": "Text to type (type)."}),
+                            ),
+                        ],
+                        &["action"],
+                    ),
+                ),
+            ],
+            crate::model::floor_class,
+        )
+    }
+
+    /// Runs one Unity/Godot/floor call: the `blender_call`
+    /// skeleton (canonical lookup, compiled-in class, the
+    /// shared `decide()` gate, op-logged refusals) over the
+    /// target adapters. `family` is "unity", "godot", or
+    /// "floor" and selects the name table, the class lookup,
+    /// and the configured adapter.
+    async fn adapter_call(
+        &self,
+        family: &str,
+        name: &str,
+        args: &Value,
+        meta: &Map<String, Value>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let elapsed = || u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let refuse = |code: &str, message: &str, class: Option<ToolClass>| {
+            self.oplog.record_with(
+                name,
+                class.map(|c| c.as_str()),
+                Some(args),
+                &format!("refused:{code}"),
+                Some(elapsed()),
+                None,
+                LogExtra::default(),
+            );
+            typed_refusal(code, message)
+        };
+        let names: Vec<&'static str> = match family {
+            "unity" => crate::model::unity_tool_names(),
+            "godot" => crate::model::godot_tool_names(),
+            _ => crate::model::floor_tool_names(),
+        };
+        let Some(canonical) = names
+            .into_iter()
+            .find(|tool| tool.eq_ignore_ascii_case(name))
+        else {
+            return Ok(refuse(
+                codes::UNKNOWN_TOOL,
+                &format!("unknown {family} tool {name:?}"),
+                None,
+            ));
+        };
+        let class = match family {
+            "unity" => self.config.unity_class_of(canonical),
+            "godot" => self.config.godot_class_of(canonical),
+            _ => self.config.floor_class_of(canonical),
+        }
+        .expect("adapter table names always classify");
+        let (toolset, short_name) = crate::model::split_name(canonical);
+        let record = ToolRecord {
+            name: canonical.to_string(),
+            toolset,
+            short_name,
+            description: String::new(),
+            input_schema: json!({"type": "object"}),
+            class,
+        };
+        let operator_token_ok = self.config.operator_token_digest.as_ref().is_some_and(|d| {
+            meta.get(META_OPERATOR_TOKEN)
+                .and_then(Value::as_str)
+                .is_some_and(|token| token_matches(token, d))
+        });
+        if let Decision::Refuse { code, message } = policy::decide(
+            &ToolKnowledge::Classified(&record),
+            &self.config,
+            operator_token_ok,
+        ) {
+            return Ok(refuse(code, &message, Some(class)));
+        }
+        let configured = match family {
+            "unity" => self.unity.is_some(),
+            "godot" => self.godot.is_some(),
+            _ => self.floor.is_some(),
+        };
+        if !configured {
+            return Ok(refuse(
+                codes::TARGET_UNAVAILABLE,
+                &format!(
+                    "the {family} adapter is not configured on this broker \
+                     (no [{family}] section)"
+                ),
+                Some(class),
+            ));
+        }
+        let unity = self.unity.clone();
+        let godot = self.godot.clone();
+        let floor = self.floor.clone();
+        let args_owned = args.clone();
+        let outcome = tokio::task::spawn_blocking(move || -> TargetResult<Value> {
+            let missing = || {
+                TargetError::unavailable(format!(
+                    "{canonical} adapter missing (the handler checked configuration)"
+                ))
+            };
+            match canonical {
+                "unity.status" => unity.as_deref().ok_or_else(missing)?.attach(),
+                "unity.projects" => unity.as_deref().ok_or_else(missing)?.projects(),
+                "unity.inspect" => unity.as_deref().ok_or_else(missing)?.inspect(&args_owned),
+                "unity.run_method" => unity
+                    .as_deref()
+                    .ok_or_else(missing)?
+                    .execute("run_method", &args_owned),
+                "godot.status" => godot.as_deref().ok_or_else(missing)?.attach(),
+                "godot.inspect" => godot.as_deref().ok_or_else(missing)?.inspect(&args_owned),
+                "godot.run_script" => godot
+                    .as_deref()
+                    .ok_or_else(missing)?
+                    .execute("run_script", &args_owned),
+                "gui.floor_windows" => floor.as_deref().ok_or_else(missing)?.inspect(&args_owned),
+                "gui.floor_screenshot" => {
+                    floor.as_deref().ok_or_else(missing)?.observe(&args_owned)
+                }
+                "gui.floor_act" => floor.as_deref().ok_or_else(missing)?.actuate(&args_owned),
+                _ => Err(TargetError::new(
+                    codes::UNKNOWN_TOOL,
+                    format!("no adapter dispatch for {canonical}"),
+                )),
+            }
+        })
+        .await
+        .map_err(|e| McpError::internal_error(format!("adapter worker join: {e}"), None))?;
+        match outcome {
+            Ok(result) => {
+                self.oplog.record_with(
+                    canonical,
+                    Some(class.as_str()),
+                    Some(args),
+                    "ok",
+                    Some(elapsed()),
+                    None,
+                    LogExtra::default(),
+                );
+                if canonical == "gui.floor_screenshot" {
+                    // The frame rides as an image content block;
+                    // the JSON payload keeps its digest and
+                    // geometry (the vision tools' shape).
+                    let image = result
+                        .get("image_base64")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    if let Some(image) = image {
+                        let mut payload = result;
+                        if let Some(object) = payload.as_object_mut() {
+                            object.remove("image_base64");
+                        }
+                        let mut result = CallToolResult::success(vec![
+                            ContentBlock::image(image, "image/png"),
+                            ContentBlock::text(
+                                serde_json::to_string(&payload)
+                                    .unwrap_or_else(|_| payload.to_string()),
+                            ),
+                        ]);
+                        result.structured_content = Some(payload);
+                        return Ok(result);
+                    }
+                }
+                Ok(json_result(&result))
+            }
+            Err(error) => Ok(refuse(error.code, &error.message, Some(class))),
+        }
+    }
+
     async fn surface_snapshot(&self) -> Option<Surface> {
         let downstream = self.downstream.clone();
         let config = self.config.clone();
@@ -1421,6 +1801,7 @@ impl SeahawkServer {
                 "reported_version": self.blender.as_ref()
                     .and_then(|client| client.reported_version()),
             },
+            "targets": self.targets.declarations(),
             "class_overrides": self.config.class_overrides.len(),
             "oplog_path": self.oplog.path().display().to_string(),
             "tool_profile": self.config.tool_profile.spec_string(),
@@ -1865,6 +2246,63 @@ fn window_json(window: &WindowInfo) -> Value {
 
 /// A success result carrying a frame: image block + text summary,
 /// structured payload attached (the gui_call screenshot shape).
+/// Builds an object input schema from (name, spec) pairs and
+/// a required list — the shape the estate-authored adapter
+/// tool constructors (Unity, Godot, the floor) share.
+fn object_schema(props: Vec<(&str, Value)>, required: &[&str]) -> Arc<Map<String, Value>> {
+    let mut map = Map::new();
+    map.insert("type".to_string(), json!("object"));
+    let mut properties = Map::new();
+    for (name, spec) in props {
+        properties.insert(name.to_string(), spec);
+    }
+    map.insert("properties".to_string(), Value::Object(properties));
+    if !required.is_empty() {
+        map.insert("required".to_string(), json!(required));
+    }
+    Arc::new(map)
+}
+
+/// One adapter tool spec: (name, description, input schema).
+type AdapterToolSpec = (&'static str, &'static str, Arc<Map<String, Value>>);
+
+/// Maps adapter (name, description, schema) specs to tools
+/// with class-derived annotations — the `blender_tools`
+/// discipline, shared by the Unity, Godot, and floor
+/// constructors: reads are read-only/idempotent, everything
+/// else is destructive, and execute/actuate descriptions
+/// carry the default-deny banner.
+fn adapter_toolset(
+    specs: Vec<AdapterToolSpec>,
+    class_of: fn(&str) -> Option<ToolClass>,
+) -> Vec<Tool> {
+    specs
+        .into_iter()
+        .map(|(name, description, schema)| {
+            let class = class_of(name).expect("adapter spec names come from the class table");
+            let (read_only, destructive, idempotent) = match class {
+                ToolClass::Read => (true, false, true),
+                _ => (false, true, false),
+            };
+            let annotations = ToolAnnotations::new()
+                .read_only(read_only)
+                .destructive(destructive)
+                .idempotent(idempotent)
+                .open_world(false);
+            let description = match class {
+                ToolClass::Execute => format!(
+                    "[execute-class: default-deny — requires policy enablement and a per-call operator token] {description}"
+                ),
+                ToolClass::Actuate => format!(
+                    "[actuate-class: default-deny — requires policy enablement and a per-call operator token] {description}"
+                ),
+                _ => description.to_string(),
+            };
+            Tool::new(name, description, schema).with_annotations(annotations)
+        })
+        .collect()
+}
+
 fn image_result(payload: &Value, frame: &Frame, summary: String) -> CallToolResult {
     use base64::Engine as _;
     let mut result = CallToolResult::success(vec![
@@ -4258,7 +4696,15 @@ impl ServerHandler for SeahawkServer {
              (the broker's local vision model, or answer the broker's ticket \
              yourself with agent_answer); gui.act_verified actuates through the \
              same actuate gate and verifies the expected effect against a fresh \
-             capture, re-grounding and retrying at most twice before refusing."
+             capture, re-grounding and retrying at most twice before refusing. \
+             Target adapters (generalization): target.list declares every \
+             automation target — Unreal and Blender (scripted-deep), Unity and \
+             Godot when configured (scripted-deep: unity.run_method and \
+             godot.run_script are execute-class under the same two-key rule), \
+             and a generic-GUI floor for applications with no scripting API \
+             (gui.floor_windows / gui.floor_screenshot read-class, \
+             gui.floor_act actuate-class; the floor declares no execution and \
+             no state beyond what its window list and screenshots show)."
                 .to_string(),
         );
         info
@@ -4290,6 +4736,18 @@ impl ServerHandler for SeahawkServer {
         // a deployment, not a default (DESIGN §1).
         if self.config.blender.is_some() {
             tools.extend(Self::blender_tools());
+        }
+        // The target adapters' tools (generalization,
+        // 2026-11-24), each listed only when its section is
+        // configured — adapters are deployments, not defaults.
+        if self.config.unity.is_some() {
+            tools.extend(Self::unity_tools());
+        }
+        if self.config.godot.is_some() {
+            tools.extend(Self::godot_tools());
+        }
+        if self.config.floor.is_some() {
+            tools.extend(Self::floor_tools());
         }
         if let Some(surface) = self.surface_snapshot().await {
             tools.extend(surface.tools.iter().map(Self::brokered_tool));
@@ -4395,6 +4853,33 @@ impl ServerHandler for SeahawkServer {
                 .await?
                 .into());
         }
+        // The target adapters' namespaces (generalization,
+        // 2026-11-24): Seahawk's own, dispatched to the
+        // adapters — never to the UE downstream. Unknown names
+        // refuse inside the handler. The floor's tools ride the
+        // `gui.` namespace but are exact names, matched here
+        // before the unknown-`gui.` refusal below.
+        if name.to_lowercase().starts_with("unity.") {
+            return Ok(self
+                .adapter_call("unity", name, &arguments, &context.meta.0)
+                .await?
+                .into());
+        }
+        if name.to_lowercase().starts_with("godot.") {
+            return Ok(self
+                .adapter_call("godot", name, &arguments, &context.meta.0)
+                .await?
+                .into());
+        }
+        if crate::model::floor_tool_names()
+            .iter()
+            .any(|tool| tool.eq_ignore_ascii_case(name))
+        {
+            return Ok(self
+                .adapter_call("floor", name, &arguments, &context.meta.0)
+                .await?
+                .into());
+        }
         // The `gui.` prefix is Seahawk's own namespace: a name in
         // it that policy did not register is unknown, full stop —
         // it is never forwarded downstream (where it would blur
@@ -4416,6 +4901,7 @@ impl ServerHandler for SeahawkServer {
         }
         let result = match name {
             NATIVE_STATUS => self.status_result(),
+            TARGET_LIST => json_result(&json!({"targets": self.targets.declarations()})),
             NATIVE_SURFACE => {
                 let refresh = arguments
                     .get("refresh")
@@ -4494,6 +4980,15 @@ mod tests {
         for tool in SeahawkServer::blender_tools() {
             census.push((tool.name.to_string(), ToolProfile::pack_of(&tool.name)));
         }
+        for tool in SeahawkServer::unity_tools() {
+            census.push((tool.name.to_string(), ToolProfile::pack_of(&tool.name)));
+        }
+        for tool in SeahawkServer::godot_tools() {
+            census.push((tool.name.to_string(), ToolProfile::pack_of(&tool.name)));
+        }
+        for tool in SeahawkServer::floor_tools() {
+            census.push((tool.name.to_string(), ToolProfile::pack_of(&tool.name)));
+        }
         let feedback = SeahawkServer::feedback_tool();
         census.push((
             feedback.name.to_string(),
@@ -4519,6 +5014,7 @@ mod tests {
             ("seahawk_status", None),
             ("seahawk_surface", None),
             ("seahawk_oplog", None),
+            ("target.list", None),
             ("seahawk_acquire", Some(Pack::Acquire)),
             ("gui.observe", Some(Pack::Vision)),
             ("gui.ground", Some(Pack::Vision)),
@@ -4548,6 +5044,16 @@ mod tests {
             ("blender.contact_sheet", Some(Pack::Blender)),
             ("blender.sim_bake", Some(Pack::Blender)),
             ("blender.take_export", Some(Pack::Blender)),
+            ("unity.status", Some(Pack::Unity)),
+            ("unity.projects", Some(Pack::Unity)),
+            ("unity.inspect", Some(Pack::Unity)),
+            ("unity.run_method", Some(Pack::Unity)),
+            ("godot.status", Some(Pack::Godot)),
+            ("godot.inspect", Some(Pack::Godot)),
+            ("godot.run_script", Some(Pack::Godot)),
+            ("gui.floor_windows", Some(Pack::Gui)),
+            ("gui.floor_screenshot", Some(Pack::Gui)),
+            ("gui.floor_act", Some(Pack::Gui)),
             ("code.feedback", Some(Pack::Feedback)),
             ("gui.blender.observe", Some(Pack::Gui)),
             ("gui.blender.actuate", Some(Pack::Gui)),

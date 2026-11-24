@@ -83,6 +83,19 @@ pub mod codes {
     pub const BLENDER_ARTIFACT_INVALID: &str = "seahawk_blender_artifact_invalid";
     /// Blender provider: the addon answered with an error.
     pub const BLENDER_PROVIDER_ERROR: &str = "seahawk_blender_provider_error";
+    /// Target adapters (generalization): no adapter is declared
+    /// for the named target id.
+    pub const TARGET_UNKNOWN: &str = "seahawk_target_unknown";
+    /// Target adapters: the named target does not declare the
+    /// requested operation in its capability declaration — the
+    /// refusal is by declaration, before the target was touched.
+    pub const TARGET_CAPABILITY: &str = "seahawk_target_capability";
+    /// Target adapters: the target is not configured on this
+    /// broker, or its transport cannot be reached.
+    pub const TARGET_UNAVAILABLE: &str = "seahawk_target_unavailable";
+    /// Target adapters: the adapter ran and the operation
+    /// failed; the message carries the target's own report.
+    pub const TARGET_FAILED: &str = "seahawk_target_failed";
 }
 
 #[derive(Debug, Eq, PartialEq)]

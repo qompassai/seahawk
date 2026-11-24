@@ -175,3 +175,31 @@ path = "seahawk-oplog.jsonl"
 # name = "godot"
 # display_name = "Godot"
 # window_match = ["Godot"]
+#
+# Target adapters (generalization, 2026-11-24). Unreal is the
+# [downstream] broker above and Blender is the [blender]
+# provider; the three sections below add the remaining
+# declared targets. Each is a deployment: uncomment to enable.
+# target.list reports every adapter's capability declaration.
+# unity.run_method and godot.run_script are execute-class:
+# they also need a [policy] execute_enabled entry naming them,
+# plus the per-call operator token, exactly like the blender
+# execute tools.
+#
+# [unity]
+# cli_path = "/home/phaedrus/.local/bin/unity"   # default: "unity" (PATH)
+# timeout_secs = 1200                            # one batchmode run bound
+#
+# [godot]
+# binary = "/usr/bin/godot"                      # the default
+# timeout_secs = 120                             # one headless run bound
+#
+# The generic-GUI floor: applications with no scripting API,
+# driven over the host's live Wayland session (hyprctl window
+# discovery, grim screenshots, ydotool input). gui.floor_act
+# is actuate-class: enable it via [policy] actuate_enabled =
+# ["gui.floor_act"] plus the per-call operator token.
+#
+# [floor]
+# ydotool_socket = "/run/user/1000/.ydotool_socket"   # the default
+# runtime_dir = "/run/user/1000"                      # optional pin
