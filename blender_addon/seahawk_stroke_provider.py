@@ -38,6 +38,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sys
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -46,7 +47,7 @@ import bpy
 from mathutils import Quaternion, Vector
 
 PROVIDER_NAME = "seahawk-stroke-provider"
-PROVIDER_VERSION = "1.0.0"
+PROVIDER_VERSION = "1.1.0"
 SCHEMA = "seahawk.stroke/v1"
 
 # Artifact bounds (DESIGN §2): refused, never truncated.
@@ -725,8 +726,1500 @@ def scene_census():
             "scene": bpy.context.scene.name if bpy.context.scene else None}
 
 
+
+
 # ---------------------------------------------------------------------------
-# The twelve ops
+# Animation layer (DESIGN-ANIM): takes, poses, curves, GP frame
+# ranges, bake, gated render. Mirrors the broker's validators
+# (src/take.rs) rule for rule: canonical JSON, embedded SHA-256,
+# 6-decimal-string numerics, bounds refused never truncated,
+# the v2 excluded set refused by name. Capture is transcription
+# (the API's own values, read verbatim); apply constructs
+# keyframe points from data, never through Blender's
+# interactive keying operators (DESIGN-ANIM §2.1).
+# ---------------------------------------------------------------------------
+
+TAKE_SCHEMA = "seahawk.take/v2"
+POSE_SCHEMA = "seahawk.pose/v2"
+TAKE_EXPORT_SCHEMA = "seahawk.take-export/v2"
+
+MAX_CHANNELS = 4096
+MAX_KEYS_PER_CHANNEL = 4096
+MAX_KEYS_TOTAL = 1000000
+MAX_FRAME_SPAN = 3600
+MAX_GP_TRACKS = 64
+MAX_GP_REFS_TOTAL = 3600
+MAX_POSE_CHANNELS = 4096
+MAX_ID_CHARS = 128
+MAX_NAME_CHARS = 256
+
+INTERPS = {
+    "CONSTANT", "LINEAR", "BEZIER", "SINE", "QUAD", "CUBIC",
+    "QUART", "QUINT", "EXPO", "CIRC", "BACK", "BOUNCE", "ELASTIC",
+}
+EASING_INTERPS = {
+    "SINE", "QUAD", "CUBIC", "QUART", "QUINT", "EXPO", "CIRC", "BACK",
+}
+EASINGS = {"AUTO", "EASE_IN", "EASE_OUT", "EASE_IN_OUT"}
+HANDLE_TYPES = {"AUTO_CLAMPED", "AUTO", "VECTOR", "ALIGNED", "FREE"}
+EXTRAPOLATIONS = {"CONSTANT", "LINEAR"}
+V2_EXCLUDED_KEYS = {
+    "driver", "drivers", "fcurve_modifiers", "modifier", "modifiers", "nla",
+}
+_TRANSFORM_PROPS = {"location", "rotation_euler", "rotation_quaternion", "scale"}
+_BONE_PATH = re.compile(r'^pose\.bones\["([^"]+)"\]\.(location|rotation_euler|rotation_quaternion|scale)$')
+_KEY_PATH = re.compile(r'^key_blocks\["([^"]+)"\]\.value$')
+_DEC6 = re.compile(r"^-?\d+\.\d{6}$")
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+
+# Session artifact store: GP drawings this provider captured
+# (or was handed) this process, keyed by content hash. A take
+# binds GP drawings by hash; take_apply resolves them here or
+# from the call's own artifacts map, and refuses by hash when
+# neither holds them (DESIGN-ANIM §1.3).
+_ARTIFACT_STORE = {}
+
+
+def _is_dec6(value):
+    return isinstance(value, str) and _DEC6.match(value) is not None
+
+
+def _is_sha256(value):
+    return isinstance(value, str) and _SHA256_HEX.match(value) is not None
+
+
+def _find_excluded_v2(value, in_bake_settings=False):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if not in_bake_settings and (
+                key in EXCLUDED_KEYS or key in V2_EXCLUDED_KEYS
+            ):
+                return key
+            child_in_settings = (
+                key == "settings"
+                and "settings_sha256" in value
+                and "system" in value
+            )
+            hit = _find_excluded_v2(child, in_bake_settings or child_in_settings)
+            if hit is not None:
+                return hit
+    elif isinstance(value, list):
+        for item in value:
+            hit = _find_excluded_v2(item, in_bake_settings)
+            if hit is not None:
+                return hit
+    return None
+
+
+def _check_keys(obj, allowed, what):
+    for key in obj.keys():
+        if key not in allowed:
+            raise ProviderError(
+                "%s carries unknown key %r; the v2 schema admits only %s"
+                % (what, key, sorted(allowed))
+            )
+
+
+def _required_string(obj, key, what, limit=MAX_NAME_CHARS):
+    value = obj.get(key)
+    if not isinstance(value, str) or not value or len(value) > limit:
+        raise ProviderError(
+            "%s.%s must be a non-empty string of at most %d characters"
+            % (what, key, limit)
+        )
+    return value
+
+
+def _check_path(path, what):
+    if path in _TRANSFORM_PROPS:
+        return
+    if _BONE_PATH.match(path) or _KEY_PATH.match(path):
+        return
+    raise ProviderError(
+        "%s.path %r is not a v2 channel address (a bare transform "
+        "property, pose.bones[\"<bone>\"].<property>, or "
+        "key_blocks[\"<block>\"].value)" % (what, path)
+    )
+
+
+def _channel_address(channel):
+    ident = channel["id"]
+    return "%s:%s|%s|%d" % (ident["type"], ident["name"],
+                            channel["path"], channel["index"])
+
+
+def _check_handle_pair(key, field, what):
+    value = key.get(field)
+    if value is None:
+        return None
+    if (
+        not isinstance(value, list)
+        or len(value) != 2
+        or not all(_is_dec6(part) for part in value)
+    ):
+        raise ProviderError(
+            "%s.%s must be null or [frame, value] as 6-decimal strings"
+            % (what, field)
+        )
+    return value
+
+
+def _check_handle_type(key, field, what):
+    value = key.get(field)
+    if value is None:
+        return None
+    if value not in HANDLE_TYPES:
+        raise ProviderError(
+            "%s.%s must be null or one of %s" % (what, field, sorted(HANDLE_TYPES))
+        )
+    return value
+
+
+def _check_key(key, what):
+    if not isinstance(key, dict):
+        raise ProviderError("%s must be an object" % what)
+    _check_keys(
+        key,
+        {"frame", "value", "interp", "easing", "handle_left", "handle_right",
+         "handle_left_type", "handle_right_type", "back", "amplitude", "period"},
+        what,
+    )
+    if not _is_dec6(key.get("frame")):
+        raise ProviderError("%s.frame must be a 6-decimal string (D2)" % what)
+    if not _is_dec6(key.get("value")):
+        raise ProviderError("%s.value must be a 6-decimal string (D2)" % what)
+    interp = key.get("interp")
+    if interp not in INTERPS:
+        raise ProviderError(
+            "%s.interp %r is not in Blender's interpolation enum" % (what, interp))
+    easing = key.get("easing")
+    if easing is not None:
+        if interp not in EASING_INTERPS:
+            raise ProviderError(
+                "%s.easing is set but interpolation %s does not read an "
+                "easing mode" % (what, interp))
+        if easing not in EASINGS:
+            raise ProviderError(
+                "%s.easing %r must be one of %s" % (what, easing, sorted(EASINGS)))
+    elif interp in EASING_INTERPS:
+        raise ProviderError(
+            "%s.easing is required by interpolation %s" % (what, interp))
+    handle_left = _check_handle_pair(key, "handle_left", what)
+    handle_right = _check_handle_pair(key, "handle_right", what)
+    handle_left_type = _check_handle_type(key, "handle_left_type", what)
+    handle_right_type = _check_handle_type(key, "handle_right_type", what)
+    if interp == "BEZIER":
+        if (handle_left is None or handle_right is None
+                or handle_left_type is None or handle_right_type is None):
+            raise ProviderError(
+                "%s is a BEZIER key without full handle data; handles are "
+                "carried, never recomputed (DESIGN-ANIM §3)" % what)
+    elif (handle_left is not None or handle_right is not None
+            or handle_left_type is not None or handle_right_type is not None):
+        raise ProviderError(
+            "%s carries handle data but interpolation %s does not read "
+            "handles" % (what, interp))
+    for field, required in (
+        ("back", interp == "BACK"),
+        ("amplitude", interp == "ELASTIC"),
+        ("period", interp == "ELASTIC"),
+    ):
+        value = key.get(field)
+        if value is not None and not _is_dec6(value):
+            raise ProviderError(
+                "%s.%s must be null or a 6-decimal string" % (what, field))
+        if required and value is None:
+            raise ProviderError(
+                "%s.%s is required by interpolation %s; a key that omits "
+                "data evaluation would read is malformed" % (what, field, interp))
+        if not required and value is not None:
+            raise ProviderError(
+                "%s.%s is set but interpolation %s does not read it"
+                % (what, field, interp))
+    return float(key["frame"])
+
+
+def _check_channel_head(channel, what, with_extrapolation):
+    if not isinstance(channel, dict):
+        raise ProviderError("%s must be an object" % what)
+    if with_extrapolation:
+        allowed = {"id", "slot", "path", "index", "extrapolation", "keys"}
+    else:
+        allowed = {"id", "slot", "path", "index", "value", "handle_left",
+                   "handle_right", "handle_left_type", "handle_right_type"}
+    _check_keys(channel, allowed, what)
+    ident = channel.get("id")
+    if not isinstance(ident, dict):
+        raise ProviderError("%s.id must be an object" % what)
+    _check_keys(ident, {"type", "name"}, "%s.id" % what)
+    _required_string(ident, "type", "%s.id" % what)
+    _required_string(ident, "name", "%s.id" % what)
+    slot = channel.get("slot")
+    if slot is not None and (not isinstance(slot, str) or not slot):
+        raise ProviderError("%s.slot must be null or a non-empty string" % what)
+    _check_path(_required_string(channel, "path", what), what)
+    index = channel.get("index")
+    if not isinstance(index, int) or isinstance(index, bool) or not (0 <= index <= 3):
+        raise ProviderError("%s.index must be an integer within 0..=3" % what)
+    if with_extrapolation and channel.get("extrapolation") not in EXTRAPOLATIONS:
+        raise ProviderError(
+            "%s.extrapolation must be CONSTANT | LINEAR" % what)
+    return _channel_address(channel)
+
+
+def _check_frames_block(frames, what):
+    if not isinstance(frames, dict):
+        raise ProviderError("%s must be an object" % what)
+    _check_keys(frames, {"start", "end", "fps_num", "fps_base"}, what)
+    start, end = frames.get("start"), frames.get("end")
+    if (not isinstance(start, int) or isinstance(start, bool)
+            or not isinstance(end, int) or isinstance(end, bool)
+            or start < 0 or end < start):
+        raise ProviderError(
+            "%s.start and %s.end must be non-negative integers, end >= start"
+            % (what, what))
+    if end - start > MAX_FRAME_SPAN:
+        raise ProviderError(
+            "%s spans %d frames; the bound is %d (refused, not truncated)"
+            % (what, end - start, MAX_FRAME_SPAN))
+    fps_num = frames.get("fps_num")
+    if not isinstance(fps_num, int) or isinstance(fps_num, bool) or fps_num < 1:
+        raise ProviderError("%s.fps_num must be an integer >= 1" % what)
+    if not _is_dec6(frames.get("fps_base")) or float(frames["fps_base"]) <= 0.0:
+        raise ProviderError(
+            "%s.fps_base must be a positive 6-decimal string" % what)
+    return frames
+
+
+def _check_scene_target(envelope, what, target_keys):
+    target = envelope.get("target")
+    if not isinstance(target, dict):
+        raise ProviderError("%s.target must be an object" % what)
+    _check_keys(target, target_keys, "%s.target" % what)
+    if not _is_sha256(target.get("scene_sha256")):
+        raise ProviderError(
+            "%s.target.scene_sha256 must be 64 lowercase hex characters "
+            "(the scene-hash binding, DESIGN-ANIM §1.1)" % what)
+    return target
+
+
+def _check_envelope_hash(envelope, what):
+    claimed = envelope.get("sha256")
+    if not _is_sha256(claimed):
+        raise ProviderError(
+            "%s.sha256 is required (64 lowercase hex, over the canonical "
+            "bytes)" % what)
+    actual = content_hash(envelope)
+    if claimed != actual:
+        raise ProviderError(
+            "%s.sha256 does not match the canonical content hash (claimed "
+            "%s, computed %s); the artifact is refused, not repaired"
+            % (what, claimed, actual))
+
+
+def validate_take(envelope):
+    """Mirror of src/take.rs validate_take: returns an info dict."""
+    if not isinstance(envelope, dict):
+        raise ProviderError("take must be a JSON object")
+    excluded = _find_excluded_v2(envelope)
+    if excluded is not None:
+        raise ProviderError(
+            "take carries excluded construct %r: drivers, NLA, F-curve "
+            "modifiers, and the v1 interactive-engine features are "
+            "policy-excluded because a take must be self-contained key "
+            "data (DESIGN-ANIM §3)" % excluded)
+    _check_keys(
+        envelope,
+        {"schema", "id", "created_by", "target", "frames", "channels",
+         "gp_tracks", "bake", "sha256"},
+        "take",
+    )
+    if envelope.get("schema") != TAKE_SCHEMA:
+        raise ProviderError("take.schema must be %r" % TAKE_SCHEMA)
+    _required_string(envelope, "id", "take", MAX_ID_CHARS)
+    if "created_by" in envelope and envelope["created_by"] is not None:
+        if not isinstance(envelope["created_by"], str) \
+                or len(envelope["created_by"]) > MAX_NAME_CHARS:
+            raise ProviderError("take.created_by must be a short string")
+    target = _check_scene_target(envelope, "take", {"scene_sha256", "rig"})
+    rig = target.get("rig")
+    if rig is not None and (not isinstance(rig, str) or not rig):
+        raise ProviderError("take.target.rig must be null or a non-empty string")
+    frames = _check_frames_block(envelope.get("frames"), "take.frames")
+    channels = envelope.get("channels")
+    if not isinstance(channels, list):
+        raise ProviderError("take.channels must be an array")
+    if len(channels) > MAX_CHANNELS:
+        raise ProviderError(
+            "take carries %d channels; the bound is %d (refused, not "
+            "truncated)" % (len(channels), MAX_CHANNELS))
+    addresses = set()
+    total_keys = 0
+    for index, channel in enumerate(channels):
+        what = "take.channels[%d]" % index
+        address = _check_channel_head(channel, what, True)
+        if address in addresses:
+            raise ProviderError(
+                "take carries channel %s twice; two channels writing one "
+                "address in one take is a refusal (DESIGN-ANIM §1.2)" % address)
+        addresses.add(address)
+        keys = channel.get("keys")
+        if not isinstance(keys, list) or not keys:
+            raise ProviderError("%s.keys must be a non-empty array" % what)
+        if len(keys) > MAX_KEYS_PER_CHANNEL:
+            raise ProviderError(
+                "%s carries %d keys; the bound is %d (refused, not "
+                "truncated)" % (what, len(keys), MAX_KEYS_PER_CHANNEL))
+        total_keys += len(keys)
+        if total_keys > MAX_KEYS_TOTAL:
+            raise ProviderError(
+                "take carries more than %d keys in total (refused, not "
+                "truncated)" % MAX_KEYS_TOTAL)
+        previous = None
+        for key_index, key in enumerate(keys):
+            key_what = "%s.keys[%d]" % (what, key_index)
+            frame = _check_key(key, key_what)
+            if frame < frames["start"] or frame > frames["end"]:
+                raise ProviderError(
+                    "%s.frame %s lies outside the take range %d..=%d; a "
+                    "key outside the range is a refusal, not a clip "
+                    "(DESIGN-ANIM §1.1)"
+                    % (key_what, key["frame"], frames["start"], frames["end"]))
+            if previous is not None and frame <= previous:
+                raise ProviderError(
+                    "%s.frame %s does not ascend past the previous key"
+                    % (key_what, key["frame"]))
+            previous = frame
+    gp_tracks = envelope.get("gp_tracks")
+    if not isinstance(gp_tracks, list):
+        raise ProviderError(
+            "take.gp_tracks is required (an empty array when the take "
+            "has no GP)")
+    if len(gp_tracks) > MAX_GP_TRACKS:
+        raise ProviderError(
+            "take carries %d GP tracks; the bound is %d (refused, not "
+            "truncated)" % (len(gp_tracks), MAX_GP_TRACKS))
+    total_refs = 0
+    for index, track in enumerate(gp_tracks):
+        what = "take.gp_tracks[%d]" % index
+        if not isinstance(track, dict):
+            raise ProviderError("%s must be an object" % what)
+        _check_keys(track, {"object", "layer", "frames"}, what)
+        _required_string(track, "object", what)
+        _required_string(track, "layer", what)
+        track_frames = track.get("frames")
+        if not isinstance(track_frames, list) or not track_frames:
+            raise ProviderError("%s.frames must be a non-empty array" % what)
+        previous = None
+        for ref_index, entry in enumerate(track_frames):
+            entry_what = "%s.frames[%d]" % (what, ref_index)
+            if not isinstance(entry, dict):
+                raise ProviderError("%s must be an object" % entry_what)
+            _check_keys(entry, {"frame", "artifact"}, entry_what)
+            frame = entry.get("frame")
+            if not isinstance(frame, int) or isinstance(frame, bool) or frame < 0:
+                raise ProviderError(
+                    "%s.frame must be a non-negative integer" % entry_what)
+            if frame < frames["start"] or frame > frames["end"]:
+                raise ProviderError(
+                    "%s.frame %d lies outside the take range %d..=%d"
+                    % (entry_what, frame, frames["start"], frames["end"]))
+            if previous is not None and frame <= previous:
+                raise ProviderError(
+                    "%s.frame %d does not ascend" % (entry_what, frame))
+            previous = frame
+            if not _is_sha256(entry.get("artifact")):
+                raise ProviderError(
+                    "%s.artifact must be the 64-hex content hash of a v1 "
+                    "gp_strokes artifact (DESIGN-ANIM §1.3)" % entry_what)
+        total_refs += len(track_frames)
+        if total_refs > MAX_GP_REFS_TOTAL:
+            raise ProviderError(
+                "take carries more than %d GP frame references (refused, "
+                "not truncated)" % MAX_GP_REFS_TOTAL)
+    bake = envelope.get("bake")
+    baked = False
+    if bake is not None:
+        baked = True
+        if not isinstance(bake, dict):
+            raise ProviderError("take.bake must be null or an object")
+        _check_keys(
+            bake,
+            {"system", "blender", "frames", "settings", "settings_sha256",
+             "channels", "evidence"},
+            "take.bake",
+        )
+        _required_string(bake, "system", "take.bake")
+        _required_string(bake, "blender", "take.bake")
+        _required_string(bake, "evidence", "take.bake")
+        bake_frames = _check_frames_block(bake.get("frames"), "take.bake.frames")
+        if (bake_frames["start"] != frames["start"]
+                or bake_frames["end"] != frames["end"]
+                or bake_frames["fps_num"] != frames["fps_num"]
+                or bake_frames["fps_base"] != frames["fps_base"]):
+            raise ProviderError(
+                "take.bake.frames must equal the take's frame block "
+                "(DESIGN-ANIM §4.2)")
+        settings = bake.get("settings")
+        if not isinstance(settings, dict):
+            raise ProviderError("take.bake.settings must be an object")
+        settings_hash = hashlib.sha256(canonical_bytes(settings)).hexdigest()
+        if bake.get("settings_sha256") != settings_hash:
+            raise ProviderError(
+                "take.bake.settings_sha256 does not match the settings "
+                "content hash (computed %s); a bake whose settings are "
+                "not recorded exactly is a rumour (DESIGN-ANIM §4.2)"
+                % settings_hash)
+        baked_channels = bake.get("channels")
+        if not isinstance(baked_channels, list) or not baked_channels:
+            raise ProviderError(
+                "take.bake.channels must name at least one baked channel")
+        for entry in baked_channels:
+            if not isinstance(entry, str) or entry not in addresses:
+                raise ProviderError(
+                    "take.bake.channels names %r, which is not a channel "
+                    "of this take" % (entry,))
+    _check_envelope_hash(envelope, "take")
+    return {
+        "id": envelope["id"],
+        "sha256": envelope["sha256"],
+        "channels": len(channels),
+        "keys": total_keys,
+        "gp_tracks": len(gp_tracks),
+        "gp_refs": total_refs,
+        "baked": baked,
+    }
+
+
+def validate_pose(envelope):
+    """Mirror of src/take.rs validate_pose: returns an info dict."""
+    if not isinstance(envelope, dict):
+        raise ProviderError("pose must be a JSON object")
+    excluded = _find_excluded_v2(envelope)
+    if excluded is not None:
+        raise ProviderError(
+            "pose carries excluded construct %r (DESIGN-ANIM §3)" % excluded)
+    _check_keys(
+        envelope,
+        {"schema", "id", "created_by", "target", "frame", "channels",
+         "insert", "sha256"},
+        "pose",
+    )
+    if envelope.get("schema") != POSE_SCHEMA:
+        raise ProviderError("pose.schema must be %r" % POSE_SCHEMA)
+    _required_string(envelope, "id", "pose", MAX_ID_CHARS)
+    _check_scene_target(envelope, "pose", {"scene_sha256"})
+    frame = envelope.get("frame")
+    if not isinstance(frame, int) or isinstance(frame, bool) or frame < 0:
+        raise ProviderError("pose.frame must be a non-negative integer")
+    insert = envelope.get("insert")
+    if not isinstance(insert, dict):
+        raise ProviderError("pose.insert must be an object")
+    _check_keys(insert, {"interp"}, "pose.insert")
+    insert_interp = insert.get("interp")
+    if insert_interp not in ("CONSTANT", "LINEAR", "BEZIER"):
+        raise ProviderError(
+            "pose.insert.interp must be CONSTANT | LINEAR | BEZIER")
+    channels = envelope.get("channels")
+    if not isinstance(channels, list) or not channels:
+        raise ProviderError("pose.channels must be a non-empty array")
+    if len(channels) > MAX_POSE_CHANNELS:
+        raise ProviderError(
+            "pose carries %d channels; the bound is %d (refused, not "
+            "truncated)" % (len(channels), MAX_POSE_CHANNELS))
+    addresses = set()
+    for index, channel in enumerate(channels):
+        what = "pose.channels[%d]" % index
+        address = _check_channel_head(channel, what, False)
+        if address in addresses:
+            raise ProviderError("pose carries channel %s twice" % address)
+        addresses.add(address)
+        if not _is_dec6(channel.get("value")):
+            raise ProviderError(
+                "%s.value must be a 6-decimal string (D2)" % what)
+        handle_left = _check_handle_pair(channel, "handle_left", what)
+        handle_right = _check_handle_pair(channel, "handle_right", what)
+        handle_left_type = _check_handle_type(channel, "handle_left_type", what)
+        handle_right_type = _check_handle_type(channel, "handle_right_type", what)
+        has_handles = (handle_left is not None and handle_right is not None
+                       and handle_left_type is not None
+                       and handle_right_type is not None)
+        if insert_interp == "BEZIER" and not has_handles:
+            raise ProviderError(
+                "%s carries no handles, but pose.insert.interp is BEZIER; "
+                "a BEZIER insert is admissible only if the pose carries "
+                "handles per channel (DESIGN-ANIM §1.4)" % what)
+        if insert_interp != "BEZIER" and (
+            handle_left is not None or handle_right is not None
+            or handle_left_type is not None or handle_right_type is not None
+        ):
+            raise ProviderError(
+                "%s carries handle data, but pose.insert.interp is %s"
+                % (what, insert_interp))
+    _check_envelope_hash(envelope, "pose")
+    return {"id": envelope["id"], "sha256": envelope["sha256"],
+            "channels": len(channels)}
+
+
+def action_digest(take):
+    """Mirror of src/take.rs action_digest (DESIGN-ANIM §6.1)."""
+    lines = []
+    for channel in take["channels"]:
+        ident = channel["id"]
+        lines.append("C|%s|%s|%s|%s|%d|%s" % (
+            ident["type"], ident["name"], channel.get("slot") or "",
+            channel["path"], channel["index"], channel["extrapolation"]))
+        for key in channel["keys"]:
+            def text(field):
+                value = key.get(field)
+                return value if isinstance(value, str) else ""
+
+            def pair(field):
+                value = key.get(field)
+                if isinstance(value, list) and len(value) == 2:
+                    return "%s,%s" % (value[0], value[1])
+                return ""
+
+            lines.append("K|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" % (
+                text("frame"), text("value"), text("interp"), text("easing"),
+                pair("handle_left"), pair("handle_right"),
+                text("handle_left_type"), text("handle_right_type"),
+                text("back"), text("amplitude"), text("period")))
+    payload = "".join(line + "\n" for line in lines)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Animation scene machinery
+# ---------------------------------------------------------------------------
+
+def _scene_sha256():
+    path = bpy.data.filepath
+    if not path or not os.path.isfile(path):
+        raise ProviderError(
+            "no scene file is open in the session; the scene-hash "
+            "binding cannot be established")
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
+
+
+def _check_scene_binding(claimed):
+    current = _scene_sha256()
+    if claimed != current:
+        raise ProviderError(
+            "the artifact is bound to scene %s but the open scene "
+            "hashes to %s; refused before mutation (stale scene "
+            "hash, DESIGN-ANIM §1.1)" % (claimed, current))
+
+
+def _fps_block():
+    scene = bpy.context.scene
+    return {
+        "fps_num": scene.render.fps,
+        "fps_base": fmt6(scene.render.fps_base),
+    }
+
+
+def _check_anim_exclusions(adt, label):
+    if adt is None:
+        return
+    if len(adt.drivers) > 0:
+        raise ProviderError(
+            "drivers on %s: a take must be self-contained key data "
+            "and drivers are evaluation-time state outside the key "
+            "set (DESIGN-ANIM §3); capture refuses" % label)
+    for track in adt.nla_tracks:
+        if len(track.strips) > 0:
+            raise ProviderError(
+                "NLA track %r on %s: NLA is evaluation-time state "
+                "outside the key set (DESIGN-ANIM §3); capture "
+                "refuses" % (track.name, label))
+
+
+def _read_slot(adt, label):
+    action = adt.action
+    slot = adt.action_slot
+    if slot is not None:
+        return slot
+    if len(action.slots) == 1:
+        return action.slots[0]
+    if len(action.slots) > 1:
+        raise ProviderError(
+            "the action on %s binds %d slots and none is assigned; "
+            "capture cannot attribute its channels" % (label, len(action.slots)))
+    return None
+
+
+def _fcurves_for_read(adt, label):
+    """(slot, fcurve collection) for the owner's bound action,
+    with the layered-action exclusions enforced by name."""
+    action = adt.action
+    if action is None:
+        return None, []
+    slot = _read_slot(adt, label)
+    if len(action.layers) == 0:
+        return slot, action.fcurves
+    strips = [
+        strip
+        for layer in action.layers
+        for strip in layer.strips
+        if strip.type == "KEYFRAME"
+    ]
+    if len(strips) > 1:
+        raise ProviderError(
+            "multi-strip layered action on %s: %d keyframe strips; "
+            "v2 carries one strip per slot (DESIGN-ANIM §3); "
+            "capture refuses" % (label, len(strips)))
+    if not strips:
+        return slot, []
+    if slot is None:
+        raise ProviderError(
+            "the layered action on %s has no resolvable slot; "
+            "capture refuses" % label)
+    bag = strips[0].channelbag(slot)
+    return slot, (bag.fcurves if bag is not None else [])
+
+
+def _fcurves_for_write(owner, id_type, id_name, action_name):
+    """The fcurve collection to write into: a fresh named action
+    (replace semantics) when action_name is given, else the
+    owner's current action, created on first use."""
+    adt = owner.animation_data
+    if adt is None:
+        adt = owner.animation_data_create()
+    if action_name is not None:
+        existing = bpy.data.actions.get(action_name)
+        if existing is not None:
+            bpy.data.actions.remove(existing)
+        action = bpy.data.actions.new(action_name)
+        slot = action.slots.new(id_type, id_name)
+        layer = action.layers.new("Layer")
+        strip = layer.strips.new(type="KEYFRAME")
+        bag = strip.channelbags.new(slot)
+        adt.action = action
+        adt.action_slot = slot
+        return bag.fcurves
+    action = adt.action
+    if action is None:
+        return _fcurves_for_write(
+            owner, id_type, id_name, "Seahawk_" + id_name)
+    slot = adt.action_slot
+    if slot is None:
+        if len(action.slots) == 1:
+            slot = action.slots[0]
+        elif len(action.slots) == 0:
+            slot = action.slots.new(id_type, id_name)
+        else:
+            raise ProviderError(
+                "the action on %s binds %d slots and none is "
+                "assigned; apply cannot attribute its channels"
+                % (id_name, len(action.slots)))
+        adt.action_slot = slot
+    if len(action.layers) == 0:
+        return action.fcurves
+    strips = [
+        strip
+        for layer in action.layers
+        for strip in layer.strips
+        if strip.type == "KEYFRAME"
+    ]
+    if len(strips) > 1:
+        raise ProviderError(
+            "multi-strip layered action on %s: v2 writes one strip "
+            "per slot (DESIGN-ANIM §3); apply refuses" % id_name)
+    if strips:
+        bag = strips[0].channelbag(slot)
+        if bag is None:
+            bag = strips[0].channelbags.new(slot)
+        return bag.fcurves
+    layer = action.layers.new("Layer")
+    strip = layer.strips.new(type="KEYFRAME")
+    return strip.channelbags.new(slot).fcurves
+
+
+def _resolve_owner(id_type, id_name):
+    if id_type == "OBJECT":
+        obj = bpy.data.objects.get(id_name)
+        if obj is None:
+            raise ProviderError("no object named %r" % id_name)
+        return obj
+    if id_type == "KEY":
+        datablock = bpy.data.shape_keys.get(id_name)
+        if datablock is None:
+            raise ProviderError("no Key datablock named %r" % id_name)
+        return datablock
+    if id_type == "GREASE_PENCIL":
+        for obj in bpy.data.objects:
+            if obj.type == "GREASEPENCIL" and obj.data is not None \
+                    and obj.data.name == id_name:
+                return obj
+        raise ProviderError("no Grease Pencil datablock named %r" % id_name)
+    raise ProviderError(
+        "channel id type %r is not resolvable by this provider build"
+        % id_type)
+
+
+def _anim_owners():
+    owners = [(obj, "OBJECT") for obj in bpy.data.objects]
+    owners.extend((datablock, "KEY") for datablock in bpy.data.shape_keys)
+    return owners
+
+
+def _capture_key(kp):
+    interp = kp.interpolation
+    bezier = interp == "BEZIER"
+    return {
+        "frame": fmt6(kp.co.x),
+        "value": fmt6(kp.co.y),
+        "interp": interp,
+        "easing": kp.easing if interp in EASING_INTERPS else None,
+        "handle_left": (
+            [fmt6(kp.handle_left.x), fmt6(kp.handle_left.y)] if bezier else None
+        ),
+        "handle_right": (
+            [fmt6(kp.handle_right.x), fmt6(kp.handle_right.y)] if bezier else None
+        ),
+        "handle_left_type": kp.handle_left_type if bezier else None,
+        "handle_right_type": kp.handle_right_type if bezier else None,
+        "back": fmt6(kp.back) if interp == "BACK" else None,
+        "amplitude": fmt6(kp.amplitude) if interp == "ELASTIC" else None,
+        "period": fmt6(kp.period) if interp == "ELASTIC" else None,
+    }
+
+
+def _capture_fcurve(id_type, id_name, slot_id, fc, label):
+    if len(fc.modifiers) > 0:
+        raise ProviderError(
+            "F-curve modifiers on channel %s of %s: modifiers are "
+            "evaluation-time state outside the key set "
+            "(DESIGN-ANIM §3); capture refuses" % (fc.data_path, label))
+    return {
+        "id": {"type": id_type, "name": id_name},
+        "slot": slot_id,
+        "path": fc.data_path,
+        "index": fc.array_index,
+        "extrapolation": fc.extrapolation,
+        "keys": [_capture_key(kp) for kp in fc.keyframe_points],
+    }
+
+
+def _apply_key(kp, key):
+    kp.interpolation = key["interp"]
+    if key.get("easing") is not None:
+        kp.easing = key["easing"]
+    if key["interp"] == "BEZIER":
+        kp.handle_left_type = key["handle_left_type"]
+        kp.handle_right_type = key["handle_right_type"]
+        kp.handle_left = (float(key["handle_left"][0]),
+                          float(key["handle_left"][1]))
+        kp.handle_right = (float(key["handle_right"][0]),
+                           float(key["handle_right"][1]))
+    if key["interp"] == "BACK":
+        kp.back = float(key["back"])
+    if key["interp"] == "ELASTIC":
+        kp.amplitude = float(key["amplitude"])
+        kp.period = float(key["period"])
+
+
+def _write_fcurve(fcurves, channel):
+    path, index = channel["path"], channel["index"]
+    for fc in list(fcurves):
+        if fc.data_path == path and fc.array_index == index:
+            fcurves.remove(fc)
+            break
+    fc = fcurves.new(path, index=index)
+    fc.extrapolation = channel["extrapolation"]
+    for key in channel["keys"]:
+        kp = fc.keyframe_points.insert(float(key["frame"]),
+                                       float(key["value"]))
+        _apply_key(kp, key)
+    fc.update()
+    return fc
+
+
+def _find_fcurve(fcurves, path, index):
+    for fc in fcurves:
+        if fc.data_path == path and fc.array_index == index:
+            return fc
+    return None
+
+
+def _action_name(take_id, id_name):
+    raw = "%s_%s" % (take_id, id_name)
+    return re.sub(r"[^A-Za-z0-9_.\-]+", "_", raw)[:60]
+
+
+# ---------------------------------------------------------------------------
+# GP frame-range machinery: per-frame drawings through the v1
+# artifact shape. v1's capture_gp merges every frame into one
+# artifact; the range ops keep frames apart (DESIGN-ANIM §1.3).
+# ---------------------------------------------------------------------------
+
+def _drawing_strokes(drawing):
+    strokes_out = []
+    colour_attr = None
+    attrs = getattr(drawing, "attributes", None)
+    if attrs is not None and "vertex_color" in attrs:
+        colour_attr = attrs["vertex_color"]
+    for s_index, stroke in enumerate(drawing.strokes):
+        points_out = []
+        colours = []
+        for point in stroke.points:
+            pos = point.position
+            points_out.append({
+                "p": [fmt6(pos.x), fmt6(pos.y), fmt6(pos.z)],
+                "pressure": fmt6(point.opacity),
+                "radius": fmt6(point.radius),
+            })
+            if colour_attr is not None:
+                entry = colour_attr.data[
+                    _point_offset(drawing, s_index) + len(points_out) - 1
+                ]
+                colours.append(tuple(entry.color))
+        entry = {"points": points_out}
+        if colours and all(c == colours[0] for c in colours):
+            entry["colour"] = [float(c) for c in colours[0]]
+        strokes_out.append(entry)
+    return strokes_out
+
+
+def _capture_frame_artifact(object_name, layer_name, frame):
+    artifact = {
+        "schema": SCHEMA,
+        "kind": "gp_strokes",
+        "id": "capture-" + object_name,
+        "created_by": PROVIDER_NAME + " " + PROVIDER_VERSION,
+        "target": {"object": object_name, "layer": layer_name,
+                   "frame": frame.frame_number},
+        "strokes": _drawing_strokes(frame.drawing),
+    }
+    artifact["sha256"] = content_hash(artifact)
+    validate_artifact(artifact)
+    _ARTIFACT_STORE[artifact["sha256"]] = artifact
+    return artifact
+
+
+def _write_drawing(drawing, strokes):
+    counts = [len(stroke["points"]) for stroke in strokes]
+    drawing.add_strokes(counts)
+    colour_values = []
+    have_colour = False
+    for s_index, stroke in enumerate(strokes):
+        gp_stroke = drawing.strokes[s_index]
+        colour = stroke.get("colour")
+        for p_index, point in enumerate(stroke["points"]):
+            gp_point = gp_stroke.points[p_index]
+            gp_point.position = [dec(axis, "p") for axis in point["p"]]
+            gp_point.opacity = dec(point["pressure"], "pressure")
+            gp_point.radius = dec(point["radius"], "radius")
+            if colour is not None:
+                have_colour = True
+                colour_values.append(tuple(float(c) for c in colour))
+            else:
+                colour_values.append((0.0, 0.0, 0.0, 1.0))
+    if have_colour:
+        attr = drawing.attributes.new("vertex_color", "FLOAT_COLOR", "POINT")
+        for index, colour in enumerate(colour_values):
+            attr.data[index].color = colour
+
+
+def _replay_track(track, artifacts):
+    resolved = []
+    for entry in track["frames"]:
+        digest = entry["artifact"]
+        artifact = artifacts.get(digest) or _ARTIFACT_STORE.get(digest)
+        if artifact is None:
+            raise ProviderError(
+                "GP track references artifact %s, which was not "
+                "supplied and is not in this session's capture "
+                "store (refused before mutation)" % digest)
+        kind, _ = validate_artifact(artifact)
+        if kind != "gp_strokes":
+            raise ProviderError(
+                "GP track reference %s is a %s artifact, not "
+                "gp_strokes" % (digest, kind))
+        _ARTIFACT_STORE[digest] = artifact
+        resolved.append((entry["frame"], artifact))
+    name = track["object"]
+    existing = bpy.data.objects.get(name)
+    if existing is not None:
+        bpy.data.objects.remove(existing, do_unlink=True)
+    data = bpy.data.grease_pencils.new(name)
+    obj = bpy.data.objects.new(name, data)
+    bpy.context.scene.collection.objects.link(obj)
+    layer = data.layers.new(track["layer"], set_active=True)
+    for frame_number, artifact in resolved:
+        frame = layer.frames.new(frame_number)
+        _write_drawing(frame.drawing, artifact["strokes"])
+    return {"object": obj.name, "frames": len(resolved)}
+
+
+# ---------------------------------------------------------------------------
+# Ops 13-25 (DESIGN-ANIM §2)
+# ---------------------------------------------------------------------------
+
+def pose_capture(params):
+    frame = params.get("frame")
+    if not isinstance(frame, int) or isinstance(frame, bool) or frame < 0:
+        raise ProviderError("pose_capture requires an integer \"frame\"",
+                            INVALID_PARAMS)
+    channels = []
+    for datablock, fallback_type in _anim_owners():
+        adt = datablock.animation_data
+        if adt is None or adt.action is None:
+            continue
+        _check_anim_exclusions(adt, datablock.name)
+        slot, fcurves = _fcurves_for_read(adt, datablock.name)
+        id_type = slot.target_id_type if slot is not None else fallback_type
+        slot_id = slot.identifier if slot is not None else None
+        for fc in fcurves:
+            if len(fc.keyframe_points) == 0:
+                continue
+            if len(fc.modifiers) > 0:
+                raise ProviderError(
+                    "F-curve modifiers on channel %s of %s "
+                    "(DESIGN-ANIM §3); capture refuses"
+                    % (fc.data_path, datablock.name))
+            channels.append({
+                "id": {"type": id_type, "name": datablock.name},
+                "slot": slot_id,
+                "path": fc.data_path,
+                "index": fc.array_index,
+                "value": fmt6(fc.evaluate(float(frame))),
+                "handle_left": None,
+                "handle_right": None,
+                "handle_left_type": None,
+                "handle_right_type": None,
+            })
+    if not channels:
+        raise ProviderError(
+            "the bound scene holds no animated channels to pose from")
+    channels.sort(key=_channel_address)
+    pose = {
+        "schema": POSE_SCHEMA,
+        "id": "pose-%d" % frame,
+        "created_by": PROVIDER_NAME + " " + PROVIDER_VERSION,
+        "target": {"scene_sha256": _scene_sha256()},
+        "frame": frame,
+        "channels": channels,
+        "insert": {"interp": "LINEAR"},
+    }
+    pose["sha256"] = content_hash(pose)
+    validate_pose(pose)
+    return {"pose": pose}
+
+
+def pose_apply(params):
+    pose = params.get("pose")
+    info = validate_pose(pose)
+    _check_scene_binding(pose["target"]["scene_sha256"])
+    interp = pose["insert"]["interp"]
+    frame = float(pose["frame"])
+    for channel in pose["channels"]:
+        owner = _resolve_owner(channel["id"]["type"], channel["id"]["name"])
+        fcurves = _fcurves_for_write(
+            owner, channel["id"]["type"], channel["id"]["name"], None)
+        fc = _find_fcurve(fcurves, channel["path"], channel["index"])
+        if fc is None:
+            fc = fcurves.new(channel["path"], index=channel["index"])
+        key = {
+            "interp": interp,
+            "easing": None,
+            "handle_left": channel.get("handle_left"),
+            "handle_right": channel.get("handle_right"),
+            "handle_left_type": channel.get("handle_left_type"),
+            "handle_right_type": channel.get("handle_right_type"),
+            "back": None, "amplitude": None, "period": None,
+        }
+        target_kp = None
+        for kp in fc.keyframe_points:
+            if kp.co.x == frame:
+                target_kp = kp
+                break
+        if target_kp is None:
+            target_kp = fc.keyframe_points.insert(
+                frame, float(channel["value"]))
+        else:
+            target_kp.co.y = float(channel["value"])
+        _apply_key(target_kp, key)
+        fc.update()
+    bpy.context.view_layer.update()
+    return {"id": info["id"], "frame": pose["frame"],
+            "channels": info["channels"]}
+
+
+def curve_capture(params):
+    id_type = params.get("id_type")
+    id_name = params.get("id_name")
+    path = params.get("path")
+    index = params.get("index")
+    if not isinstance(id_type, str) or not isinstance(id_name, str) \
+            or not isinstance(path, str) \
+            or not isinstance(index, int) or isinstance(index, bool):
+        raise ProviderError(
+            "curve_capture requires id_type, id_name, path, index",
+            INVALID_PARAMS)
+    owner = _resolve_owner(id_type, id_name)
+    adt = owner.animation_data
+    if adt is None or adt.action is None:
+        raise ProviderError("%s %r holds no action" % (id_type, id_name))
+    _check_anim_exclusions(adt, id_name)
+    slot_wanted = params.get("slot")
+    if isinstance(slot_wanted, str) and slot_wanted:
+        slot = None
+        for candidate in adt.action.slots:
+            if candidate.identifier == slot_wanted:
+                slot = candidate
+                break
+        if slot is None:
+            raise ProviderError(
+                "action on %r has no slot %r" % (id_name, slot_wanted))
+        if len(adt.action.layers) == 0:
+            fcurves = adt.action.fcurves
+        else:
+            strips = [
+                strip
+                for layer in adt.action.layers
+                for strip in layer.strips
+                if strip.type == "KEYFRAME"
+            ]
+            if len(strips) > 1:
+                raise ProviderError(
+                    "multi-strip layered action on %s; capture "
+                    "refuses (DESIGN-ANIM §3)" % id_name)
+            bag = strips[0].channelbag(slot) if strips else None
+            fcurves = bag.fcurves if bag is not None else []
+    else:
+        slot, fcurves = _fcurves_for_read(adt, id_name)
+    fc = _find_fcurve(fcurves, path, index)
+    if fc is None:
+        raise ProviderError(
+            "no channel %s[%d] on %s %r" % (path, index, id_type, id_name))
+    if len(fc.keyframe_points) == 0:
+        raise ProviderError(
+            "channel %s[%d] on %r holds no keys" % (path, index, id_name))
+    channel = _capture_fcurve(
+        id_type, id_name,
+        slot.identifier if slot is not None else None, fc, id_name)
+    return {"channel": channel}
+
+
+def curve_apply(params):
+    channel = params.get("channel")
+    if not isinstance(channel, dict):
+        raise ProviderError("curve_apply requires a \"channel\" object",
+                            INVALID_PARAMS)
+    _check_channel_head(channel, "channel", True)
+    keys = channel.get("keys")
+    if not isinstance(keys, list) or not keys:
+        raise ProviderError("channel.keys must be a non-empty array")
+    if len(keys) > MAX_KEYS_PER_CHANNEL:
+        raise ProviderError(
+            "channel carries %d keys; the bound is %d (refused, not "
+            "truncated)" % (len(keys), MAX_KEYS_PER_CHANNEL))
+    previous = None
+    for key_index, key in enumerate(keys):
+        frame = _check_key(key, "channel.keys[%d]" % key_index)
+        if previous is not None and frame <= previous:
+            raise ProviderError("channel keys do not ascend by frame")
+        previous = frame
+    claimed = params.get("scene_sha256")
+    if not _is_sha256(claimed):
+        raise ProviderError(
+            "curve_apply requires the open scene's \"scene_sha256\"",
+            INVALID_PARAMS)
+    _check_scene_binding(claimed)
+    owner = _resolve_owner(channel["id"]["type"], channel["id"]["name"])
+    fcurves = _fcurves_for_write(
+        owner, channel["id"]["type"], channel["id"]["name"], None)
+    _write_fcurve(fcurves, channel)
+    bpy.context.view_layer.update()
+    return {"channel": _channel_address(channel)}
+
+
+def take_capture(params):
+    scene = bpy.context.scene
+    channels = []
+    for datablock, fallback_type in _anim_owners():
+        adt = datablock.animation_data
+        if adt is None or adt.action is None:
+            continue
+        _check_anim_exclusions(adt, datablock.name)
+        slot, fcurves = _fcurves_for_read(adt, datablock.name)
+        id_type = slot.target_id_type if slot is not None else fallback_type
+        slot_id = slot.identifier if slot is not None else None
+        for fc in fcurves:
+            if len(fc.keyframe_points) == 0:
+                continue
+            channels.append(_capture_fcurve(
+                id_type, datablock.name, slot_id, fc, datablock.name))
+    channels.sort(key=_channel_address)
+    gp_tracks = []
+    artifacts = {}
+    gp_objects = sorted(
+        (o for o in bpy.data.objects if o.type == "GREASEPENCIL"),
+        key=lambda o: o.name)
+    for obj in gp_objects:
+        for layer in obj.data.layers:
+            frames = []
+            for frame in sorted(layer.frames, key=lambda f: f.frame_number):
+                artifact = _capture_frame_artifact(obj.name, layer.name, frame)
+                artifacts[artifact["sha256"]] = artifact
+                frames.append({"frame": frame.frame_number,
+                               "artifact": artifact["sha256"]})
+            if frames:
+                gp_tracks.append({"object": obj.name, "layer": layer.name,
+                                  "frames": frames})
+    if not channels and not gp_tracks:
+        raise ProviderError(
+            "the bound scene holds no authored animation to capture")
+    all_frames = [float(k["frame"]) for c in channels for k in c["keys"]]
+    all_frames += [float(e["frame"]) for t in gp_tracks for e in t["frames"]]
+    rig = next((o.name for o in bpy.data.objects if o.type == "ARMATURE"),
+               None)
+    take = {
+        "schema": TAKE_SCHEMA,
+        "id": params.get("id") or ("capture-" + (rig or scene.name or "scene")),
+        "created_by": PROVIDER_NAME + " " + PROVIDER_VERSION,
+        "target": {"scene_sha256": _scene_sha256(), "rig": rig},
+        "frames": {
+            "start": int(math.floor(min(all_frames))),
+            "end": int(math.ceil(max(all_frames))),
+            **_fps_block(),
+        },
+        "channels": channels,
+        "gp_tracks": gp_tracks,
+        "bake": None,
+    }
+    take["sha256"] = content_hash(take)
+    info = validate_take(take)
+    return {"take": take, "artifacts": artifacts,
+            "action_digest": action_digest(take), **info}
+
+
+def take_apply(params):
+    take = params.get("take")
+    info = validate_take(take)
+    _check_scene_binding(take["target"]["scene_sha256"])
+    artifacts = params.get("artifacts")
+    if isinstance(artifacts, dict):
+        for digest, artifact in artifacts.items():
+            if isinstance(artifact, dict):
+                _ARTIFACT_STORE[digest] = artifact
+    for track in take["gp_tracks"]:
+        for entry in track["frames"]:
+            if entry["artifact"] not in _ARTIFACT_STORE:
+                raise ProviderError(
+                    "take GP track references artifact %s, which was "
+                    "not supplied and is not in this session's "
+                    "capture store (refused before mutation)"
+                    % entry["artifact"])
+    groups = {}
+    for channel in take["channels"]:
+        key = (channel["id"]["type"], channel["id"]["name"])
+        groups.setdefault(key, []).append(channel)
+    for (id_type, id_name), group in groups.items():
+        owner = _resolve_owner(id_type, id_name)
+        fcurves = _fcurves_for_write(
+            owner, id_type, id_name, _action_name(take["id"], id_name))
+        for channel in group:
+            _write_fcurve(fcurves, channel)
+    for track in take["gp_tracks"]:
+        _replay_track(track, {})
+    bpy.context.view_layer.update()
+    return {**info, "action_digest": action_digest(take)}
+
+
+def take_validate(params):
+    take = params.get("take")
+    pose = params.get("pose")
+    if isinstance(take, dict):
+        info = validate_take(take)
+        return {"valid": True, "kind": "take",
+                "action_digest": action_digest(take), **info}
+    if isinstance(pose, dict):
+        info = validate_pose(pose)
+        return {"valid": True, "kind": "pose", **info}
+    raise ProviderError("take_validate requires a \"take\" or \"pose\" "
+                        "object", INVALID_PARAMS)
+
+
+def gp_capture_range(params):
+    object_name = params.get("object")
+    layer_name = params.get("layer")
+    start = params.get("start")
+    end = params.get("end")
+    if not isinstance(object_name, str) or not isinstance(layer_name, str) \
+            or not isinstance(start, int) or isinstance(start, bool) \
+            or not isinstance(end, int) or isinstance(end, bool) \
+            or end < start:
+        raise ProviderError(
+            "gp_capture_range requires object, layer, start, end",
+            INVALID_PARAMS)
+    if end - start > MAX_FRAME_SPAN:
+        raise ProviderError(
+            "range spans %d frames; the bound is %d (refused, not "
+            "truncated)" % (end - start, MAX_FRAME_SPAN))
+    obj = bpy.data.objects.get(object_name)
+    if obj is None or obj.type != "GREASEPENCIL":
+        raise ProviderError("no Grease Pencil object named %r" % object_name)
+    layer = obj.data.layers.get(layer_name)
+    if layer is None:
+        raise ProviderError(
+            "Grease Pencil object %r has no layer %r" % (object_name, layer_name))
+    frames = []
+    artifacts = {}
+    for frame in sorted(layer.frames, key=lambda f: f.frame_number):
+        if start <= frame.frame_number <= end:
+            artifact = _capture_frame_artifact(object_name, layer_name, frame)
+            artifacts[artifact["sha256"]] = artifact
+            frames.append({"frame": frame.frame_number,
+                           "artifact": artifact["sha256"]})
+    if not frames:
+        raise ProviderError(
+            "layer %r of %r holds no frames within %d..=%d"
+            % (layer_name, object_name, start, end))
+    track = {"object": object_name, "layer": layer_name, "frames": frames}
+    return {"track": track, "artifacts": artifacts}
+
+
+def gp_replay_range(params):
+    track = params.get("track")
+    artifacts = params.get("artifacts")
+    if not isinstance(track, dict) or not isinstance(track.get("frames"), list) \
+            or not isinstance(track.get("object"), str) \
+            or not isinstance(track.get("layer"), str):
+        raise ProviderError(
+            "gp_replay_range requires a \"track\" object (object, "
+            "layer, frames)", INVALID_PARAMS)
+    if not isinstance(artifacts, dict):
+        artifacts = {}
+    return _replay_track(track, artifacts)
+
+
+def take_render(params):
+    take = params.get("take")
+    path = params.get("path")
+    if not isinstance(path, str) or not path:
+        raise ProviderError("take_render requires a \"path\" prefix",
+                            INVALID_PARAMS)
+    take_apply(params)
+    scene = bpy.context.scene
+    if scene.camera is None:
+        raise ProviderError("the scene has no camera")
+    render = scene.render
+    frames_block = take["frames"]
+    previous = (
+        scene.frame_start, scene.frame_end, scene.frame_current,
+        render.fps, render.fps_base, render.filepath,
+        render.image_settings.file_format,
+        render.resolution_x, render.resolution_y,
+    )
+    try:
+        scene.frame_start = frames_block["start"]
+        scene.frame_end = frames_block["end"]
+        render.fps = frames_block["fps_num"]
+        render.fps_base = float(frames_block["fps_base"])
+        if isinstance(params.get("width"), int):
+            render.resolution_x = params["width"]
+        if isinstance(params.get("height"), int):
+            render.resolution_y = params["height"]
+        render.image_settings.file_format = "PNG"
+        render.filepath = path
+        bpy.ops.render.render(animation=True)
+    finally:
+        (scene.frame_start, scene.frame_end, scene.frame_current,
+         render.fps, render.fps_base, render.filepath,
+         render.image_settings.file_format,
+         render.resolution_x, render.resolution_y) = previous
+    frames_out = []
+    for frame in range(frames_block["start"], frames_block["end"] + 1):
+        candidate = "%s%04d.png" % (path, frame)
+        if not os.path.isfile(candidate):
+            raise ProviderError("render did not produce %s" % candidate)
+        frames_out.append(candidate)
+    return {"path": path, "frames": frames_out, "count": len(frames_out)}
+
+
+def contact_sheet(params):
+    frames = params.get("frames")
+    path = params.get("path")
+    if not isinstance(frames, list) or not frames \
+            or not isinstance(path, str) or not path:
+        raise ProviderError(
+            "contact_sheet requires \"frames\" and \"path\"", INVALID_PARAMS)
+    columns = params.get("columns")
+    if not isinstance(columns, int) or isinstance(columns, bool) or columns < 1:
+        columns = int(math.ceil(math.sqrt(len(frames))))
+    rows = int(math.ceil(len(frames) / float(columns)))
+    loaded = []
+    try:
+        for frame_path in frames:
+            if not os.path.isfile(frame_path):
+                raise ProviderError("no such frame file: %s" % frame_path)
+            loaded.append(bpy.data.images.load(frame_path,
+                                               check_existing=False))
+        width, height = loaded[0].size
+        for image in loaded:
+            if tuple(image.size) != (width, height):
+                raise ProviderError(
+                    "contact sheet frames must share one size; %s is "
+                    "%s, expected (%d, %d)"
+                    % (image.name, tuple(image.size), width, height))
+        sheet = bpy.data.images.new(
+            "SeahawkContactSheet", width * columns, height * rows,
+            alpha=True)
+        pixels = [0.0] * (width * columns * height * rows * 4)
+        for position, image in enumerate(loaded):
+            col = position % columns
+            row_from_top = position // columns
+            y_base = (rows - 1 - row_from_top) * height
+            x_base = col * width
+            frame_pixels = [0.0] * (width * height * 4)
+            image.pixels.foreach_get(frame_pixels)
+            for y in range(height):
+                src = y * width * 4
+                dst = ((y_base + y) * width * columns + x_base) * 4
+                pixels[dst:dst + width * 4] = frame_pixels[src:src + width * 4]
+        sheet.pixels.foreach_set(pixels)
+        sheet.update()
+        previous_format = sheet.file_format
+        previous_path = sheet.filepath_raw
+        try:
+            sheet.file_format = "PNG"
+            sheet.filepath_raw = path
+            sheet.save()
+        finally:
+            sheet.file_format = previous_format
+            sheet.filepath_raw = previous_path
+    finally:
+        for image in loaded:
+            bpy.data.images.remove(image)
+    return {"path": path, "bytes": os.path.getsize(path),
+            "frames": len(frames), "columns": columns, "rows": rows}
+
+
+def sim_bake(params):
+    system = params.get("system")
+    objects = params.get("objects")
+    start = params.get("start")
+    end = params.get("end")
+    if not isinstance(system, str) or not system \
+            or not isinstance(objects, list) or not objects \
+            or not all(isinstance(name, str) for name in objects) \
+            or not isinstance(start, int) or isinstance(start, bool) \
+            or not isinstance(end, int) or isinstance(end, bool) \
+            or end < start:
+        raise ProviderError(
+            "sim_bake requires system, objects, start, end", INVALID_PARAMS)
+    scene = bpy.context.scene
+    frames_block = {"start": start, "end": end, **_fps_block()}
+    _check_frames_block(frames_block, "sim_bake.frames")
+    for name in objects:
+        if bpy.data.objects.get(name) is None:
+            raise ProviderError("no object named %r" % name)
+    samples = {name: {"location": [], "rotation_quaternion": [], "scale": []}
+               for name in objects}
+    previous_frame = scene.frame_current
+    try:
+        for frame in range(start, end + 1):
+            scene.frame_set(frame)
+            bpy.context.view_layer.update()
+            for name in objects:
+                matrix = bpy.data.objects[name].matrix_world
+                location = matrix.to_translation()
+                quaternion = matrix.to_quaternion()
+                scale = matrix.to_scale()
+                samples[name]["location"].append(tuple(location))
+                samples[name]["rotation_quaternion"].append(tuple(quaternion))
+                samples[name]["scale"].append(tuple(scale))
+    finally:
+        scene.frame_set(previous_frame)
+        bpy.context.view_layer.update()
+    channels = []
+    for name in objects:
+        for path, components in (
+            ("location", 3), ("rotation_quaternion", 4), ("scale", 3)
+        ):
+            for index in range(components):
+                keys = []
+                for offset, frame in enumerate(range(start, end + 1)):
+                    keys.append({
+                        "frame": fmt6(frame),
+                        "value": fmt6(samples[name][path][offset][index]),
+                        "interp": "LINEAR",
+                        "easing": None,
+                        "handle_left": None,
+                        "handle_right": None,
+                        "handle_left_type": None,
+                        "handle_right_type": None,
+                        "back": None,
+                        "amplitude": None,
+                        "period": None,
+                    })
+                channels.append({
+                    "id": {"type": "OBJECT", "name": name},
+                    "slot": None,
+                    "path": path,
+                    "index": index,
+                    "extrapolation": "CONSTANT",
+                    "keys": keys,
+                })
+    channels.sort(key=_channel_address)
+    settings = {}
+    bake = {
+        "system": system,
+        "blender": bpy.app.version_string,
+        "frames": frames_block,
+        "settings": settings,
+        "settings_sha256": hashlib.sha256(
+            canonical_bytes(settings)).hexdigest(),
+        "channels": [_channel_address(c) for c in channels],
+        "evidence": (
+            "object-level evaluated bake (matrix_world per frame) "
+            "by seahawk sim_bake; pose-bone constraint baking is "
+            "not admitted in this build; admission is the caller's "
+            "twin-bake comparison (DESIGN-ANIM S4.3); springs are "
+            "provenance only."
+        )
+    }
+    take = {
+        "schema": TAKE_SCHEMA,
+        "id": "bake-" + system,
+        "created_by": PROVIDER_NAME + " " + PROVIDER_VERSION,
+        "target": {"scene_sha256": _scene_sha256(), "rig": None},
+        "frames": frames_block,
+        "channels": channels,
+        "gp_tracks": [],
+        "bake": bake,
+    }
+    take["sha256"] = content_hash(take)
+    info = validate_take(take)
+    return {"take": take, "action_digest": action_digest(take), **info}
+
+
+def take_export(params):
+    export = params.get("export")
+    path = params.get("path")
+    if not isinstance(export, dict) or not isinstance(path, str) or not path:
+        raise ProviderError("take_export requires \"export\" and \"path\"",
+                            INVALID_PARAMS)
+    if export.get("schema") != TAKE_EXPORT_SCHEMA:
+        raise ProviderError(
+            "take_export writes only %s documents" % TAKE_EXPORT_SCHEMA)
+    claimed = export.get("sha256")
+    if not _is_sha256(claimed) or content_hash(export) != claimed:
+        raise ProviderError(
+            "the export document's content hash does not verify; "
+            "refused, not repaired")
+    payload = canonical_bytes(export)
+    with open(path, "wb") as handle:
+        handle.write(payload)
+    return {"path": path, "bytes": len(payload)}
+
+
+# ---------------------------------------------------------------------------
+# The ops (v1 twelve plus the DESIGN-ANIM thirteen)
 # ---------------------------------------------------------------------------
 
 class Provider:
@@ -920,6 +2413,46 @@ class Provider:
         bpy.ops.wm.open_mainfile(filepath=path)
         return {"opened": path, "objects": len(bpy.data.objects)}
 
+
+    def pose_capture(self, params):
+        return pose_capture(params)
+
+    def pose_apply(self, params):
+        return pose_apply(params)
+
+    def curve_capture(self, params):
+        return curve_capture(params)
+
+    def curve_apply(self, params):
+        return curve_apply(params)
+
+    def take_capture(self, params):
+        return take_capture(params)
+
+    def take_apply(self, params):
+        return take_apply(params)
+
+    def take_validate(self, params):
+        return take_validate(params)
+
+    def gp_capture_range(self, params):
+        return gp_capture_range(params)
+
+    def gp_replay_range(self, params):
+        return gp_replay_range(params)
+
+    def take_render(self, params):
+        return take_render(params)
+
+    def contact_sheet(self, params):
+        return contact_sheet(params)
+
+    def sim_bake(self, params):
+        return sim_bake(params)
+
+    def take_export(self, params):
+        return take_export(params)
+
     OPS = {
         "session_status": session_status,
         "scene_census": scene_census,
@@ -933,6 +2466,19 @@ class Provider:
         "proof_render": proof_render,
         "blend_save": blend_save,
         "scene_open": scene_open,
+        "pose_capture": pose_capture,
+        "pose_apply": pose_apply,
+        "curve_capture": curve_capture,
+        "curve_apply": curve_apply,
+        "take_capture": take_capture,
+        "take_apply": take_apply,
+        "take_validate": take_validate,
+        "gp_capture_range": gp_capture_range,
+        "gp_replay_range": gp_replay_range,
+        "take_render": take_render,
+        "contact_sheet": contact_sheet,
+        "sim_bake": sim_bake,
+        "take_export": take_export,
     }
 
     def dispatch(self, method, params):
