@@ -50,6 +50,7 @@
 //! carries no refused fetch route.
 
 pub mod acquisition;
+pub mod blender;
 pub mod config;
 pub mod downstream;
 pub mod guard;
@@ -59,5 +60,6 @@ pub mod oplog;
 pub mod policy;
 pub mod profile;
 pub mod server;
+pub mod stroke;
 pub mod tooling;
 pub mod vision;

@@ -130,6 +130,46 @@ pub fn default_class(tool_name: &str) -> Option<ToolClass> {
     DEFAULT_CLASSES.get(&tool_name.to_lowercase()).copied()
 }
 
+/// The Blender stroke provider's class table (DESIGN §1): the
+/// twelve `blender.*` tools and their classes. Unlike the UE
+/// surface there is no census — the downstream is authored by
+/// the estate, so this table *is* the surface definition, and
+/// `server.rs` builds the served tools from exactly these names.
+/// Classification follows reach (DESIGN §1): reads observe or
+/// compute purely, writes mutate editor-domain state in memory,
+/// executes touch the filesystem. No blender tool is
+/// actuate-class: the data provider never injects input.
+pub const BLENDER_CLASSES: [(&str, ToolClass); 12] = [
+    ("blender.session_status", ToolClass::Read),
+    ("blender.scene_census", ToolClass::Read),
+    ("blender.gp_capture", ToolClass::Read),
+    ("blender.artifact_validate", ToolClass::Read),
+    ("blender.gp_replay", ToolClass::Write),
+    ("blender.paint_apply", ToolClass::Write),
+    ("blender.stroke_to_shell", ToolClass::Write),
+    ("blender.shells_along_flow", ToolClass::Write),
+    ("blender.image_export_png", ToolClass::Execute),
+    ("blender.proof_render", ToolClass::Execute),
+    ("blender.blend_save", ToolClass::Execute),
+    ("blender.scene_open", ToolClass::Execute),
+];
+
+/// The compiled-in class of a `blender.*` tool, if the name is
+/// one of the twelve provider tools (case-insensitive, matching
+/// the server's dispatch discipline for Seahawk-owned names).
+pub fn blender_class(tool_name: &str) -> Option<ToolClass> {
+    BLENDER_CLASSES
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(tool_name))
+        .map(|(_, class)| *class)
+}
+
+/// The canonical names of the twelve provider tools, in table
+/// order.
+pub fn blender_tool_names() -> Vec<&'static str> {
+    BLENDER_CLASSES.iter().map(|(name, _)| *name).collect()
+}
+
 /// One brokered tool as discovered downstream, with its class
 /// already decided (policy overrides applied at surface build).
 #[derive(Clone, Debug)]
@@ -229,6 +269,25 @@ mod tests {
         };
         assert_eq!(app.observe_tool(), "gui.blender.observe");
         assert_eq!(app.actuate_tool(), "gui.blender.actuate");
+    }
+
+    #[test]
+    fn blender_class_table_matches_the_design_surface() {
+        // DESIGN §1: twelve ops, four read / four write / four
+        // execute, none actuate.
+        assert_eq!(BLENDER_CLASSES.len(), 12);
+        let count = |class: ToolClass| BLENDER_CLASSES.iter().filter(|(_, c)| *c == class).count();
+        assert_eq!(count(ToolClass::Read), 4);
+        assert_eq!(count(ToolClass::Write), 4);
+        assert_eq!(count(ToolClass::Execute), 4);
+        assert_eq!(count(ToolClass::Actuate), 0);
+        assert_eq!(
+            blender_class("blender.blend_save"),
+            Some(ToolClass::Execute)
+        );
+        assert_eq!(blender_class("BLENDER.PAINT_APPLY"), Some(ToolClass::Write));
+        assert_eq!(blender_class("blender.nope"), None);
+        assert_eq!(blender_class("gui.blender.actuate"), None);
     }
 
     #[test]

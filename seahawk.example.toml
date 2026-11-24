@@ -13,7 +13,7 @@ operator_token = "change-me-operator-token"
 require_token_for_list = false
 # Tool-surface profile (D-934): "core" (default — broker
 # status/surface/op-log only), "full" (the unfiltered surface),
-# or a comma-separated list of packs: acquire, broker,
+# or a comma-separated list of packs: acquire, blender, broker,
 # feedback, gui, vision. Overridden by the SEAHAWK_TOOL_PROFILE
 # environment variable, then by the --profile launch argument.
 # An unknown pack name refuses startup.
@@ -113,6 +113,30 @@ timeout_secs = 120
 enabled = false
 # Primo at landing: under ~/.local/share/<project>/.
 quarantine_dir = "seahawk-quarantine"
+
+# The Blender stroke provider (DESIGN, seahawk-blender-20261124):
+# Seahawk as a client of the stroke-data addon inside a pinned
+# Blender session. The whole section is optional — without it the
+# blender.* tools are not listed. The provider secret is the
+# addon's only authentication (it has no native auth, exactly
+# Epic's situation), so the URL is loopback-enforced at load.
+# Execute-class blender ops (image_export_png, proof_render,
+# blend_save, scene_open) enable per tool in [policy]
+# execute_enabled by full name, like every execute tool, and
+# still need the per-call operator token. File ops additionally
+# refuse any path outside the roots below — before the provider
+# is contacted. Class overrides may raise a blender class but
+# never lower one (refused at load).
+# [blender]
+# url = "http://127.0.0.1:8471/blender"   # loopback only, enforced
+# timeout_secs = 120
+# provider_secret = "<provider-secret>"   # required when the section exists
+# expected_blender = "5.3.0"              # pinned build; write/execute refuse on mismatch
+# [blender.paths]
+# open_roots = []      # scene_open may read .blend files under these
+# save_roots = []      # blend_save may write under these (no save-in-place)
+# export_roots = []    # image_export_png may write under these
+# render_roots = []    # proof_render may write under these
 
 [oplog]
 # Append-only JSONL op log (created if absent).

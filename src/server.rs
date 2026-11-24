@@ -24,7 +24,8 @@ use rmcp::{ErrorData as McpError, RoleServer};
 use serde_json::{Map, Value, json};
 
 use crate::acquisition::{self, Mode, Transport, WorkRecord};
-use crate::config::{Config, ToolingId, VisionRoute};
+use crate::blender::BlenderClient;
+use crate::config::{BlenderRoot, Config, ToolingId, VisionRoute};
 use crate::downstream::Downstream;
 use crate::gui::WindowInfo;
 use crate::gui::{ActuateOutcome, Capture, Frame, Gui, GuiError, ObserveOutcome};
@@ -56,6 +57,10 @@ const VISION_ACT_VERIFIED: &str = "gui.act_verified";
 /// D-230 wiring: the one new broker tool. Read-class; the
 /// tooling client behind it is in the `tooling` module.
 const CODE_FEEDBACK: &str = "code.feedback";
+
+/// One row of the `blender_tools` constructor table: (name,
+/// description, input schema).
+type BlenderToolSpec = (&'static str, &'static str, Arc<Map<String, Value>>);
 
 /// One `code.feedback` episode (SPEC §3.2): calls sharing a
 /// (workspace, file-set) key inside the configured window.
@@ -230,6 +235,9 @@ pub struct SeahawkServer {
     /// Built once from policy at startup; registrations cannot
     /// change under a running server.
     gui_targets: Arc<std::collections::HashMap<String, (GuiApp, bool)>>,
+    /// The Blender stroke provider's downstream client, when a
+    /// `[blender]` section is configured (DESIGN §1).
+    blender: Option<Arc<BlenderClient>>,
     /// D-230 wiring: the tooling clients (worker-thread owned).
     tooling: Arc<ToolingPool>,
     /// D-230 wiring: feedback episodes + catalog snapshot.
@@ -252,10 +260,20 @@ impl SeahawkServer {
             VisionRoute::Agent | VisionRoute::None => None,
         };
         let tooling = Arc::new(ToolingPool::from_config(&config.tooling));
+        let blender = config.blender.as_ref().and_then(|blender_config| {
+            match BlenderClient::new(blender_config) {
+                Ok(client) => Some(Arc::new(client)),
+                Err(error) => {
+                    eprintln!("seahawk: blender provider client unavailable: {error}");
+                    None
+                }
+            }
+        });
         Self {
             config,
             downstream,
             oplog,
+            blender,
             gui: Arc::new(Gui::x11()),
             vision: Arc::new(VisionState {
                 frames: Mutex::new(FrameStore::new()),
@@ -550,6 +568,351 @@ impl SeahawkServer {
             .with_annotations(annotations)
     }
 
+    /// The twelve Blender stroke-provider tools (DESIGN §1).
+    /// Built from the same compiled-in table that classifies
+    /// them (`model::BLENDER_CLASSES`), so the served surface
+    /// and the class table cannot drift. Listed only when a
+    /// `[blender]` section is configured (see `list_tools`):
+    /// the provider is a deployment, not a default.
+    fn blender_tools() -> Vec<Tool> {
+        fn schema(props: Vec<(&str, Value)>, required: &[&str]) -> Arc<Map<String, Value>> {
+            let mut map = Map::new();
+            map.insert("type".to_string(), json!("object"));
+            let mut properties = Map::new();
+            for (name, spec) in props {
+                properties.insert(name.to_string(), spec);
+            }
+            map.insert("properties".to_string(), Value::Object(properties));
+            if !required.is_empty() {
+                map.insert("required".to_string(), json!(required));
+            }
+            Arc::new(map)
+        }
+        let artifact_prop = json!({"type": "object", "description": "A seahawk.stroke/v1 artifact (DESIGN §2): canonical-JSON envelope with an embedded SHA-256 content hash. Validated broker-side before any downstream contact; invalid artifacts refuse with seahawk_blender_artifact_invalid."});
+        let params_prop = json!({"type": "object", "description": "Shell parameters (DESIGN §2): width_root, width_tip, thickness (metres, decimal strings), segments_per_point (integer), atlas_tile {atlas_image, uv_rect [u0, v0, u1, v1]}, chain (vertex-group name), mirror_of (optional shell object name)."});
+        let path_prop = |what: &str| json!({"type": "string", "description": what});
+        let specs: Vec<BlenderToolSpec> = vec![
+            (
+                "blender.session_status",
+                "Provider session status: the Blender build string (the pinned-build gate reads it), provider version, and whether a scene is open. Read-class.",
+                schema(vec![], &[]),
+            ),
+            (
+                "blender.scene_census",
+                "The estate mesh census of the open scene: per-object vertex/face counts and the estate content digest over vertex data. Read-class.",
+                schema(vec![], &[]),
+            ),
+            (
+                "blender.gp_capture",
+                "Captures a Grease Pencil object's strokes as a seahawk.stroke/v1 gp_strokes artifact (object-local metres, 6-decimal strings, content hash). Read-class.",
+                schema(
+                    vec![(
+                        "object",
+                        json!({"type": "string", "description": "Grease Pencil object name in the open scene."}),
+                    )],
+                    &["object"],
+                ),
+            ),
+            (
+                "blender.artifact_validate",
+                "Validates a stroke artifact broker-side (schema, bounds, exclusion set, content hash) without touching the provider. Read-class.",
+                schema(vec![("artifact", artifact_prop.clone())], &["artifact"]),
+            ),
+            (
+                "blender.gp_replay",
+                "Replays a gp_strokes artifact into the scene as a Grease Pencil object named by the artifact target. Deterministic: replaying the same artifact yields the same strokes. Write-class (in-memory).",
+                schema(vec![("artifact", artifact_prop.clone())], &["artifact"]),
+            ),
+            (
+                "blender.paint_apply",
+                "Applies a paint_batch artifact to the target image with the provider's own rasterizer (round dabs, fixed spacing — the same batch always yields the same pixels). Write-class (in-memory; persist with blender.image_export_png).",
+                schema(vec![("artifact", artifact_prop.clone())], &["artifact"]),
+            ),
+            (
+                "blender.stroke_to_shell",
+                "Converts each stroke of a flow_curves artifact into one closed hair-shell mesh (fixed arc-length resample, parallel-transport frames, UVs mapped onto the atlas tile). Write-class (in-memory).",
+                schema(
+                    vec![
+                        ("artifact", artifact_prop.clone()),
+                        ("params", params_prop.clone()),
+                    ],
+                    &["artifact", "params"],
+                ),
+            ),
+            (
+                "blender.shells_along_flow",
+                "Places shells along each flow curve of a flow_curves artifact: roots spaced along the curve, shells following its sub-arcs. Write-class (in-memory).",
+                schema(
+                    vec![("artifact", artifact_prop.clone()), ("params", params_prop)],
+                    &["artifact", "params"],
+                ),
+            ),
+            (
+                "blender.image_export_png",
+                "Exports a named image datablock to a PNG file under a policy export root. Execute-class: default-deny — requires policy enablement and a per-call operator token.",
+                schema(
+                    vec![
+                        (
+                            "image",
+                            json!({"type": "string", "description": "Image datablock name."}),
+                        ),
+                        (
+                            "path",
+                            path_prop("Absolute PNG path under a [blender.paths] export root."),
+                        ),
+                    ],
+                    &["image", "path"],
+                ),
+            ),
+            (
+                "blender.proof_render",
+                "Renders the open scene to a PNG under a policy render root (estate proof discipline: fixed engine settings from the scene). Execute-class: default-deny — requires policy enablement and a per-call operator token.",
+                schema(
+                    vec![
+                        (
+                            "path",
+                            path_prop("Absolute PNG path under a [blender.paths] render root."),
+                        ),
+                        (
+                            "width",
+                            json!({"type": "integer", "description": "Optional render width in pixels (default: scene setting)."}),
+                        ),
+                        (
+                            "height",
+                            json!({"type": "integer", "description": "Optional render height in pixels (default: scene setting)."}),
+                        ),
+                        (
+                            "camera",
+                            json!({"type": "string", "description": "Optional camera object name (default: scene camera)."}),
+                        ),
+                    ],
+                    &["path"],
+                ),
+            ),
+            (
+                "blender.blend_save",
+                "Saves the working scene to an explicit .blend path under a policy save root. There is no save-in-place: the opened file is never the save target unless policy lists its directory and the caller names it. Execute-class: default-deny — requires policy enablement and a per-call operator token.",
+                schema(
+                    vec![(
+                        "path",
+                        path_prop("Absolute .blend path under a [blender.paths] save root."),
+                    )],
+                    &["path"],
+                ),
+            ),
+            (
+                "blender.scene_open",
+                "Opens a .blend file under a policy open root as the provider's working scene (a load, classified execute per the UE census precedent). Execute-class: default-deny — requires policy enablement and a per-call operator token.",
+                schema(
+                    vec![(
+                        "path",
+                        path_prop("Absolute .blend path under a [blender.paths] open root."),
+                    )],
+                    &["path"],
+                ),
+            ),
+        ];
+        specs
+            .into_iter()
+            .map(|(name, description, schema)| {
+                let class = crate::model::blender_class(name)
+                    .expect("blender_tools spec names come from the class table");
+                let (read_only, destructive, idempotent) = match class {
+                    ToolClass::Read => (true, false, true),
+                    _ => (false, true, false),
+                };
+                let annotations = ToolAnnotations::new()
+                    .read_only(read_only)
+                    .destructive(destructive)
+                    .idempotent(idempotent)
+                    .open_world(false);
+                let description = if class == ToolClass::Execute {
+                    format!(
+                        "[execute-class: default-deny — requires policy enablement and a per-call operator token] {description}"
+                    )
+                } else {
+                    description.to_string()
+                };
+                Tool::new(name, description, schema).with_annotations(annotations)
+            })
+            .collect()
+    }
+
+    /// Runs one `blender.*` call: classifies from the compiled-in
+    /// table, passes the shared `decide()` gate, runs the
+    /// broker-side pre-checks (artifact validity, path roots —
+    /// both refuse *before* the downstream is contacted, DESIGN
+    /// §4), then dispatches to the provider worker. Every
+    /// outcome, allowed and refused alike, lands in the op log
+    /// with the arguments digest — which transitively pins each
+    /// artifact's own content hash (DESIGN §5).
+    async fn blender_call(
+        &self,
+        name: &str,
+        args: &Value,
+        meta: &Map<String, Value>,
+    ) -> Result<CallToolResult, McpError> {
+        let started = Instant::now();
+        let elapsed = || u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let refuse = |code: &str, message: &str, class: Option<ToolClass>| {
+            self.oplog.record_with(
+                name,
+                class.map(|c| c.as_str()),
+                Some(args),
+                &format!("refused:{code}"),
+                Some(elapsed()),
+                None,
+                LogExtra::default(),
+            );
+            typed_refusal(code, message)
+        };
+        // Unknown provider names refuse without downstream
+        // contact (the gui_call discipline).
+        let Some(canonical) = crate::model::blender_tool_names()
+            .into_iter()
+            .find(|tool| tool.eq_ignore_ascii_case(name))
+        else {
+            return Ok(refuse(
+                codes::UNKNOWN_TOOL,
+                &format!("unknown blender tool {name:?}"),
+                None,
+            ));
+        };
+        let class = self
+            .config
+            .blender_class_of(canonical)
+            .expect("table names always classify");
+        let (toolset, short_name) = crate::model::split_name(canonical);
+        let record = ToolRecord {
+            name: canonical.to_string(),
+            toolset,
+            short_name,
+            description: String::new(),
+            input_schema: json!({"type": "object"}),
+            class,
+        };
+        let operator_token_ok = self.config.operator_token_digest.as_ref().is_some_and(|d| {
+            meta.get(META_OPERATOR_TOKEN)
+                .and_then(Value::as_str)
+                .is_some_and(|token| token_matches(token, d))
+        });
+        if let Decision::Refuse { code, message } = policy::decide(
+            &ToolKnowledge::Classified(&record),
+            &self.config,
+            operator_token_ok,
+        ) {
+            return Ok(refuse(code, &message, Some(class)));
+        }
+        // Broker-side pre-checks, before any downstream contact.
+        let artifact_ops = [
+            "blender.gp_replay",
+            "blender.paint_apply",
+            "blender.stroke_to_shell",
+            "blender.shells_along_flow",
+            "blender.artifact_validate",
+        ];
+        if artifact_ops.contains(&canonical) {
+            let Some(artifact) = args.get("artifact").filter(|a| a.is_object()) else {
+                return Err(McpError::invalid_params(
+                    format!("{canonical} requires an \"artifact\" object argument"),
+                    None,
+                ));
+            };
+            let info = match crate::stroke::validate_artifact(artifact) {
+                Ok(info) => info,
+                Err(message) => {
+                    return Ok(refuse(
+                        codes::BLENDER_ARTIFACT_INVALID,
+                        &message,
+                        Some(class),
+                    ));
+                }
+            };
+            if canonical == "blender.artifact_validate" {
+                // Pure and broker-local by definition (DESIGN §1):
+                // the report never leaves the broker.
+                let report = json!({
+                    "valid": true,
+                    "kind": info.kind.as_str(),
+                    "id": info.id,
+                    "sha256": info.sha256,
+                    "strokes": info.strokes,
+                    "points": info.points,
+                });
+                self.oplog.record_with(
+                    canonical,
+                    Some(class.as_str()),
+                    Some(args),
+                    "ok",
+                    Some(elapsed()),
+                    None,
+                    LogExtra::default(),
+                );
+                return Ok(json_result(&report));
+            }
+        }
+        let path_gate: Option<(&str, BlenderRoot)> = match canonical {
+            "blender.scene_open" => Some(("path", BlenderRoot::Open)),
+            "blender.blend_save" => Some(("path", BlenderRoot::Save)),
+            "blender.image_export_png" => Some(("path", BlenderRoot::Export)),
+            "blender.proof_render" => Some(("path", BlenderRoot::Render)),
+            _ => None,
+        };
+        if let Some((field, root)) = path_gate {
+            let Some(path_text) = args.get(field).and_then(Value::as_str) else {
+                return Err(McpError::invalid_params(
+                    format!("{canonical} requires a string \"{field}\" argument"),
+                    None,
+                ));
+            };
+            let allowed = self
+                .config
+                .blender
+                .as_ref()
+                .is_some_and(|b| b.path_allowed(root, std::path::Path::new(path_text)));
+            if !allowed {
+                return Ok(refuse(
+                    codes::BLENDER_PATH_REFUSED,
+                    &format!(
+                        "{canonical} path {path_text:?} is outside every policy root \
+                         for this op (refused before downstream contact, DESIGN §4)"
+                    ),
+                    Some(class),
+                ));
+            }
+        }
+        let Some(client) = self.blender.clone() else {
+            return Ok(refuse(
+                codes::BLENDER_UNAVAILABLE,
+                "no [blender] provider is configured on this broker",
+                Some(class),
+            ));
+        };
+        let method = canonical
+            .strip_prefix("blender.")
+            .expect("canonical names carry the prefix")
+            .to_string();
+        let params = args.clone();
+        let outcome = tokio::task::spawn_blocking(move || client.call(&method, &params, class))
+            .await
+            .map_err(|e| McpError::internal_error(format!("blender worker join: {e}"), None))?;
+        match outcome {
+            Ok(result) => {
+                self.oplog.record_with(
+                    canonical,
+                    Some(class.as_str()),
+                    Some(args),
+                    "ok",
+                    Some(elapsed()),
+                    None,
+                    LogExtra::default(),
+                );
+                Ok(json_result(&result))
+            }
+            Err(error) => Ok(refuse(error.code, &error.message, Some(class))),
+        }
+    }
+
     async fn surface_snapshot(&self) -> Option<Surface> {
         let downstream = self.downstream.clone();
         let config = self.config.clone();
@@ -607,6 +970,14 @@ impl SeahawkServer {
                 "episode_window_secs": self.config.feedback.episode_window_secs,
                 "project_roots": self.config.feedback.project_roots.iter()
                     .map(|root| root.display().to_string()).collect::<Vec<_>>(),
+            },
+            "blender_provider": {
+                "configured": self.config.blender.is_some(),
+                "url": self.config.blender.as_ref().map(|b| b.url.clone()),
+                "expected_blender": self.config.blender.as_ref()
+                    .map(|b| b.expected_blender.clone()),
+                "reported_version": self.blender.as_ref()
+                    .and_then(|client| client.reported_version()),
             },
             "class_overrides": self.config.class_overrides.len(),
             "oplog_path": self.oplog.path().display().to_string(),
@@ -3472,6 +3843,12 @@ impl ServerHandler for SeahawkServer {
         // independent of the downstream and of tooling config
         // (an unconfigured deployment refuses its calls typed).
         tools.push(Self::feedback_tool());
+        // The Blender provider's tools, listed only when a
+        // `[blender]` downstream is configured — the provider is
+        // a deployment, not a default (DESIGN §1).
+        if self.config.blender.is_some() {
+            tools.extend(Self::blender_tools());
+        }
         if let Some(surface) = self.surface_snapshot().await {
             tools.extend(surface.tools.iter().map(Self::brokered_tool));
         }
@@ -3564,6 +3941,16 @@ impl ServerHandler for SeahawkServer {
             return Ok(self
                 .vision_act_verified(arguments, operator_token)
                 .await
+                .into());
+        }
+        // The Blender provider's tools: Seahawk's own namespace,
+        // dispatched to the provider client (never to the UE
+        // downstream). Unknown `blender.` names refuse inside
+        // the handler without downstream contact.
+        if name.to_lowercase().starts_with("blender.") {
+            return Ok(self
+                .blender_call(name, &arguments, &context.meta.0)
+                .await?
                 .into());
         }
         // The `gui.` prefix is Seahawk's own namespace: a name in
@@ -3662,6 +4049,9 @@ mod tests {
         for tool in SeahawkServer::vision_tools() {
             census.push((tool.name.to_string(), ToolProfile::pack_of(&tool.name)));
         }
+        for tool in SeahawkServer::blender_tools() {
+            census.push((tool.name.to_string(), ToolProfile::pack_of(&tool.name)));
+        }
         let feedback = SeahawkServer::feedback_tool();
         census.push((
             feedback.name.to_string(),
@@ -3691,6 +4081,18 @@ mod tests {
             ("gui.observe", Some(Pack::Vision)),
             ("gui.ground", Some(Pack::Vision)),
             ("gui.act_verified", Some(Pack::Vision)),
+            ("blender.session_status", Some(Pack::Blender)),
+            ("blender.scene_census", Some(Pack::Blender)),
+            ("blender.gp_capture", Some(Pack::Blender)),
+            ("blender.artifact_validate", Some(Pack::Blender)),
+            ("blender.gp_replay", Some(Pack::Blender)),
+            ("blender.paint_apply", Some(Pack::Blender)),
+            ("blender.stroke_to_shell", Some(Pack::Blender)),
+            ("blender.shells_along_flow", Some(Pack::Blender)),
+            ("blender.image_export_png", Some(Pack::Blender)),
+            ("blender.proof_render", Some(Pack::Blender)),
+            ("blender.blend_save", Some(Pack::Blender)),
+            ("blender.scene_open", Some(Pack::Blender)),
             ("code.feedback", Some(Pack::Feedback)),
             ("gui.blender.observe", Some(Pack::Gui)),
             ("gui.blender.actuate", Some(Pack::Gui)),

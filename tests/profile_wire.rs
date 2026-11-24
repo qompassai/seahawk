@@ -408,7 +408,7 @@ fn assert_startup_refused(
         "stderr names the failure: {stderr}"
     );
     assert!(
-        stderr.contains("core, full, acquire, broker, feedback, gui, vision"),
+        stderr.contains("core, full, acquire, blender, broker, feedback, gui, vision"),
         "stderr lists the valid packs: {stderr}"
     );
 }

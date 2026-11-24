@@ -35,7 +35,7 @@ use std::fmt;
 /// The valid profile words, in the order error messages list
 /// them: the two whole-surface words, then the packs in
 /// alphabetical order.
-pub const VALID_WORDS: &str = "core, full, acquire, broker, feedback, gui, vision";
+pub const VALID_WORDS: &str = "core, full, acquire, blender, broker, feedback, gui, vision";
 
 /// Broker-core tool names: the standing operator surface. These
 /// belong to no pack and are served under every profile,
@@ -65,6 +65,9 @@ pub const VISION_TOOLS: [&str; 3] = ["gui.act_verified", "gui.ground", "gui.obse
 pub enum Pack {
     /// The acquisition lane's verb (`seahawk_acquire`).
     Acquire,
+    /// The Blender stroke provider's tools (`blender.*`),
+    /// brokered from the provider addon downstream.
+    Blender,
     /// Tools brokered from the downstream Epic editor surface.
     Broker,
     /// The D-230 `code.feedback` tool.
@@ -80,8 +83,9 @@ pub enum Pack {
 impl Pack {
     /// Every pack, alphabetical by name — the canonical order
     /// for listings and for `ToolProfile::spec_string`.
-    pub const ALL: [Pack; 5] = [
+    pub const ALL: [Pack; 6] = [
         Pack::Acquire,
+        Pack::Blender,
         Pack::Broker,
         Pack::Feedback,
         Pack::Gui,
@@ -92,6 +96,7 @@ impl Pack {
     pub fn name(self) -> &'static str {
         match self {
             Pack::Acquire => "acquire",
+            Pack::Blender => "blender",
             Pack::Broker => "broker",
             Pack::Feedback => "feedback",
             Pack::Gui => "gui",
@@ -232,6 +237,9 @@ impl ToolProfile {
         if FEEDBACK_TOOL.eq_ignore_ascii_case(tool_name) {
             return Some(Pack::Feedback);
         }
+        if tool_name.len() >= 8 && tool_name[..8].eq_ignore_ascii_case("blender.") {
+            return Some(Pack::Blender);
+        }
         if VISION_TOOLS
             .iter()
             .any(|name| name.eq_ignore_ascii_case(tool_name))
@@ -363,8 +371,9 @@ mod tests {
 
     #[test]
     fn each_pack_serves_exactly_its_family_plus_core() {
-        let cases: [(&str, &str, &str); 5] = [
+        let cases: [(&str, &str, &str); 6] = [
             ("acquire", ACQUIRE_TOOL, FEEDBACK_TOOL),
+            ("blender", "blender.paint_apply", "gui.observe"),
             ("broker", "EditorToolset.X.Y", ACQUIRE_TOOL),
             ("feedback", FEEDBACK_TOOL, "gui.observe"),
             ("gui", "gui.blender.actuate", "gui.observe"),

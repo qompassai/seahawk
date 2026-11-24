@@ -66,6 +66,23 @@ pub mod codes {
     pub const UNAUTHORIZED: &str = "seahawk_unauthorized";
     pub const DOWNSTREAM_UNAVAILABLE: &str = "seahawk_downstream_unavailable";
     pub const BAD_ARGUMENTS: &str = "seahawk_bad_arguments";
+    /// Blender provider: the downstream addon is not configured
+    /// or cannot be reached / cannot establish a session.
+    pub const BLENDER_UNAVAILABLE: &str = "seahawk_blender_unavailable";
+    /// Blender provider: the session reports a Blender build
+    /// other than the pinned one in policy; write/execute calls
+    /// are refused (reads still serve, DESIGN §4).
+    pub const BLENDER_BUILD_MISMATCH: &str = "seahawk_blender_build_mismatch";
+    /// Blender provider: a file-op path is outside every
+    /// policy-listed root for that op — refused before the
+    /// downstream is contacted (DESIGN §4).
+    pub const BLENDER_PATH_REFUSED: &str = "seahawk_blender_path_refused";
+    /// Blender provider: a stroke artifact failed validation
+    /// (schema, bounds, exclusion set, or content hash) —
+    /// refused before the downstream is contacted (DESIGN §2–3).
+    pub const BLENDER_ARTIFACT_INVALID: &str = "seahawk_blender_artifact_invalid";
+    /// Blender provider: the addon answered with an error.
+    pub const BLENDER_PROVIDER_ERROR: &str = "seahawk_blender_provider_error";
 }
 
 #[derive(Debug, Eq, PartialEq)]

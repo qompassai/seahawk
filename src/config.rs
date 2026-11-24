@@ -74,8 +74,129 @@ struct RawConfig {
     #[serde(default)]
     acquisition: RawAcquisition,
     #[serde(default)]
+    blender: Option<RawBlender>,
+    #[serde(default)]
     oplog: RawOplog,
 }
+
+/// The Blender stroke provider's downstream section (DESIGN
+/// §4). Optional: without it the `blender.*` tools are listed
+/// under their profile pack but every call refuses as
+/// unavailable — the provider is a deployment, not a default.
+#[derive(Debug, Deserialize)]
+struct RawBlender {
+    #[serde(default = "default_blender_url")]
+    url: String,
+    #[serde(default = "default_downstream_timeout")]
+    timeout_secs: u64,
+    #[serde(default)]
+    provider_secret: Option<String>,
+    #[serde(default = "default_expected_blender")]
+    expected_blender: String,
+    #[serde(default)]
+    paths: RawBlenderPaths,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawBlenderPaths {
+    #[serde(default)]
+    open_roots: Vec<String>,
+    #[serde(default)]
+    save_roots: Vec<String>,
+    #[serde(default)]
+    export_roots: Vec<String>,
+    #[serde(default)]
+    render_roots: Vec<String>,
+}
+
+fn default_blender_url() -> String {
+    // The provider addon's loopback default (DESIGN §4).
+    "http://127.0.0.1:8471/blender".to_string()
+}
+
+fn default_expected_blender() -> String {
+    // The estate's pinned build (D-1315).
+    "5.3.0".to_string()
+}
+
+/// Validated Blender provider configuration.
+#[derive(Clone, Debug)]
+pub struct BlenderConfig {
+    pub url: String,
+    pub timeout_secs: u64,
+    /// Shared secret presented to the addon per request; held
+    /// like the tokens and never logged.
+    pub provider_secret: String,
+    /// The pinned build string `session_status` must report;
+    /// write/execute calls refuse on any other build (DESIGN §4).
+    pub expected_blender: String,
+    pub open_roots: Vec<PathBuf>,
+    pub save_roots: Vec<PathBuf>,
+    pub export_roots: Vec<PathBuf>,
+    pub render_roots: Vec<PathBuf>,
+}
+
+/// Which root list a blender file op is checked against.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlenderRoot {
+    Open,
+    Save,
+    Export,
+    Render,
+}
+
+impl BlenderConfig {
+    pub fn roots(&self, kind: BlenderRoot) -> &[PathBuf] {
+        match kind {
+            BlenderRoot::Open => &self.open_roots,
+            BlenderRoot::Save => &self.save_roots,
+            BlenderRoot::Export => &self.export_roots,
+            BlenderRoot::Render => &self.render_roots,
+        }
+    }
+
+    /// Whether `path` is inside one of the roots for `kind`.
+    /// The check is lexical (components, with `.`/`..` resolved
+    /// in the component stream) and runs before the downstream
+    /// is contacted (DESIGN §4): a path that escapes its root
+    /// through `..` is outside it, whatever it spells.
+    pub fn path_allowed(&self, kind: BlenderRoot, path: &Path) -> bool {
+        let Some(normalized) = normalize_path(path) else {
+            return false;
+        };
+        self.roots(kind)
+            .iter()
+            .filter_map(|root| normalize_path(root))
+            .any(|root| normalized.starts_with(&root))
+    }
+}
+
+/// Lexically normalizes a path: must be absolute; `.` drops,
+/// `..` pops (refusing — `None` — when it would pop past the
+/// root, i.e. the path escapes upward out of itself).
+fn normalize_path(path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => out.push("/"),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(part) => out.push(part),
+            Component::Prefix(_) => return None,
+        }
+    }
+    Some(out)
+}
+
+pub const MAX_BLENDER_ROOTS: usize = 16;
 
 /// The acquisition lane's operator policy (D-246). The lane is
 /// disabled unless the operator enables it here: enablement is
@@ -378,6 +499,9 @@ pub struct Config {
     pub feedback: FeedbackConfig,
     /// Acquisition-lane configuration (D-246).
     pub acquisition: AcquisitionConfig,
+    /// Blender stroke provider configuration, when the
+    /// operator configured a `[blender]` downstream.
+    pub blender: Option<BlenderConfig>,
     pub oplog_path: PathBuf,
 }
 
@@ -442,8 +566,27 @@ impl Config {
                      read|write|actuate|execute"
                 );
             };
+            // The Blender asymmetry (DESIGN §4): an override may
+            // raise a blender tool's class but never lower it
+            // below the compiled-in table — refused at load, so
+            // a mis-authored policy cannot quietly reopen a
+            // gated provider op.
+            if let Some(table) = crate::model::blender_class(name)
+                && class.rank() < table.rank()
+            {
+                bail!(
+                    "config: policy.class_overrides[{name:?}] = {class:?} would lower \
+                     blender tool {name:?} below its compiled-in class {:?}; blender \
+                     overrides may only raise a class (DESIGN §4)",
+                    table.as_str()
+                );
+            }
             class_overrides.insert(name.to_lowercase(), class);
         }
+        let blender = match &raw.blender {
+            Some(raw_blender) => Some(parse_blender(raw_blender)?),
+            None => None,
+        };
         let gui_apps = parse_gui_apps(&raw.gui)?;
         let vision = parse_vision(&raw.vision)?;
         let tooling = parse_tooling(&raw.tooling)?;
@@ -488,6 +631,7 @@ impl Config {
             tooling,
             feedback,
             acquisition,
+            blender,
             oplog_path: raw.oplog.path,
         })
     }
@@ -499,6 +643,20 @@ impl Config {
             return Some(*class);
         }
         crate::model::default_class(tool_name)
+    }
+
+    /// The class of a `blender.*` tool: the compiled-in table
+    /// class, raised (never lowered — load refuses a lowering
+    /// override) by any configured override. `None` for names
+    /// outside the provider surface.
+    pub fn blender_class_of(&self, tool_name: &str) -> Option<ToolClass> {
+        let table = crate::model::blender_class(tool_name)?;
+        let raised = self
+            .class_overrides
+            .get(&tool_name.to_lowercase())
+            .copied()
+            .filter(|override_class| override_class.rank() > table.rank());
+        Some(raised.unwrap_or(table))
     }
 
     pub fn execute_is_enabled(&self, tool_name: &str) -> bool {
@@ -603,6 +761,71 @@ fn parse_tooling(raw: &[RawTooling]) -> anyhow::Result<Vec<ToolingEntry>> {
 }
 
 /// Validates the `[feedback]` section.
+/// Validates the `[blender]` section (DESIGN §4): loopback
+/// URL only, bounded timeout, a provider secret present, the
+/// pinned build string present, and root lists of absolute
+/// paths within bound.
+fn parse_blender(raw: &RawBlender) -> anyhow::Result<BlenderConfig> {
+    let url = raw.url.trim();
+    if url.is_empty() {
+        bail!("config: blender.url must not be empty");
+    }
+    if !(url.starts_with("http://127.0.0.1") || url.starts_with("http://[::1]")) {
+        bail!(
+            "config: blender.url must be loopback (http://127.0.0.1…), got {url:?} — \
+             the provider addon has no network authentication of its own"
+        );
+    }
+    if raw.timeout_secs == 0 || raw.timeout_secs > MAX_DOWNSTREAM_TIMEOUT_SECS {
+        bail!(
+            "config: blender.timeout_secs {} outside 1..={MAX_DOWNSTREAM_TIMEOUT_SECS}",
+            raw.timeout_secs
+        );
+    }
+    let Some(provider_secret) = raw
+        .provider_secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        bail!(
+            "config: blender.provider_secret is required — the addon refuses \
+             requests without it (it is the provider's only authentication)"
+        );
+    };
+    let expected_blender = raw.expected_blender.trim();
+    if expected_blender.is_empty() {
+        bail!("config: blender.expected_blender must not be empty");
+    }
+    let roots = |list: &[String], field: &str| -> anyhow::Result<Vec<PathBuf>> {
+        if list.len() > MAX_BLENDER_ROOTS {
+            bail!(
+                "config: blender.paths.{field} holds {} roots; the bound is {MAX_BLENDER_ROOTS}",
+                list.len()
+            );
+        }
+        list.iter()
+            .map(|entry| {
+                let path = PathBuf::from(entry.trim());
+                if !path.is_absolute() {
+                    bail!("config: blender.paths.{field} entry {entry:?} is not absolute");
+                }
+                Ok(path)
+            })
+            .collect()
+    };
+    Ok(BlenderConfig {
+        url: url.to_string(),
+        timeout_secs: raw.timeout_secs,
+        provider_secret: provider_secret.to_string(),
+        expected_blender: expected_blender.to_string(),
+        open_roots: roots(&raw.paths.open_roots, "open_roots")?,
+        save_roots: roots(&raw.paths.save_roots, "save_roots")?,
+        export_roots: roots(&raw.paths.export_roots, "export_roots")?,
+        render_roots: roots(&raw.paths.render_roots, "render_roots")?,
+    })
+}
+
 fn parse_feedback(raw: &RawFeedback) -> anyhow::Result<FeedbackConfig> {
     let mut feedback = FeedbackConfig::default();
     if let Some(max_files) = raw.max_files {
@@ -931,5 +1154,83 @@ mod tests {
     fn tool_profile_unknown_pack_is_refused_at_load() {
         let text = "[server]\nagent_token = \"x\"\ntool_profile = \"visionn\"\n";
         assert!(Config::parse(text).is_err());
+    }
+
+    const BLENDER_SECTION: &str = "[blender]\nprovider_secret = \"s3cret\"\n\
+        [blender.paths]\nopen_roots = [\"/tmp/work\"]\nsave_roots = [\"/tmp/work/out\"]\n\
+        export_roots = [\"/tmp/work/out\"]\nrender_roots = [\"/tmp/work/out\"]\n";
+
+    #[test]
+    fn blender_section_parses_and_defaults_apply() {
+        let text = format!("[server]\nagent_token = \"x\"\n{BLENDER_SECTION}");
+        let cfg = Config::parse(&text).expect("config");
+        let blender = cfg.blender.as_ref().expect("blender configured");
+        assert_eq!(blender.url, "http://127.0.0.1:8471/blender");
+        assert_eq!(blender.expected_blender, "5.3.0");
+        assert_eq!(blender.provider_secret, "s3cret");
+        // Absent section: no provider configured.
+        let cfg = Config::parse(MINIMAL).expect("minimal config");
+        assert!(cfg.blender.is_none());
+    }
+
+    #[test]
+    fn blender_section_refuses_non_loopback_and_missing_secret() {
+        let remote = "[server]\nagent_token = \"x\"\n[blender]\n\
+                      url = \"http://192.168.1.10:8471/blender\"\nprovider_secret = \"s\"\n";
+        assert!(Config::parse(remote).is_err());
+        let no_secret = "[server]\nagent_token = \"x\"\n[blender]\n";
+        assert!(Config::parse(no_secret).is_err());
+        let relative_root = "[server]\nagent_token = \"x\"\n[blender]\n\
+                             provider_secret = \"s\"\n[blender.paths]\n\
+                             open_roots = [\"relative/dir\"]\n";
+        assert!(Config::parse(relative_root).is_err());
+    }
+
+    #[test]
+    fn blender_class_override_may_raise_but_never_lower() {
+        // Lowering an execute op to write: refused at load.
+        let lowering = format!(
+            "[server]\nagent_token = \"x\"\n[policy.class_overrides]\n\
+             \"blender.blend_save\" = \"write\"\n{BLENDER_SECTION}"
+        );
+        let error = Config::parse(&lowering).expect_err("lowering must refuse");
+        assert!(error.to_string().contains("would lower"), "{error}");
+        // Raising a read op to execute: allowed, and the
+        // effective class follows the override.
+        let raising = format!(
+            "[server]\nagent_token = \"x\"\n[policy.class_overrides]\n\
+             \"blender.gp_capture\" = \"execute\"\n{BLENDER_SECTION}"
+        );
+        let cfg = Config::parse(&raising).expect("config");
+        assert_eq!(
+            cfg.blender_class_of("blender.gp_capture"),
+            Some(ToolClass::Execute)
+        );
+        assert_eq!(
+            cfg.blender_class_of("blender.paint_apply"),
+            Some(ToolClass::Write)
+        );
+        assert_eq!(cfg.blender_class_of("blender.nope"), None);
+    }
+
+    #[test]
+    fn blender_path_roots_gate_lexically() {
+        let text = format!("[server]\nagent_token = \"x\"\n{BLENDER_SECTION}");
+        let cfg = Config::parse(&text).expect("config");
+        let blender = cfg.blender.as_ref().expect("blender configured");
+        assert!(blender.path_allowed(BlenderRoot::Open, Path::new("/tmp/work/scene.blend")));
+        assert!(blender.path_allowed(BlenderRoot::Save, Path::new("/tmp/work/out/a/b.blend")));
+        // Outside every root.
+        assert!(!blender.path_allowed(BlenderRoot::Save, Path::new("/tmp/work/scene.blend")));
+        assert!(!blender.path_allowed(BlenderRoot::Open, Path::new("/etc/passwd")));
+        // Escape through `..` is outside, whatever it spells.
+        assert!(!blender.path_allowed(
+            BlenderRoot::Save,
+            Path::new("/tmp/work/out/../secret.blend")
+        ));
+        // Relative paths never allowed.
+        assert!(!blender.path_allowed(BlenderRoot::Open, Path::new("work/scene.blend")));
+        // A sibling sharing a string prefix is not inside.
+        assert!(!blender.path_allowed(BlenderRoot::Open, Path::new("/tmp/workshop/scene.blend")));
     }
 }
