@@ -61,5 +61,6 @@ pub mod policy;
 pub mod profile;
 pub mod server;
 pub mod stroke;
+pub mod take;
 pub mod tooling;
 pub mod vision;
