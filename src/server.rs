@@ -568,8 +568,9 @@ impl SeahawkServer {
             .with_annotations(annotations)
     }
 
-    /// The twelve Blender stroke-provider tools (DESIGN §1).
-    /// Built from the same compiled-in table that classifies
+    /// The twenty-five Blender provider tools (DESIGN §1 +
+    /// DESIGN-ANIM §2). Built from the same compiled-in table
+    /// that classifies
     /// them (`model::BLENDER_CLASSES`), so the served surface
     /// and the class table cannot drift. Listed only when a
     /// `[blender]` section is configured (see `list_tools`):
@@ -590,6 +591,9 @@ impl SeahawkServer {
         }
         let artifact_prop = json!({"type": "object", "description": "A seahawk.stroke/v1 artifact (DESIGN §2): canonical-JSON envelope with an embedded SHA-256 content hash. Validated broker-side before any downstream contact; invalid artifacts refuse with seahawk_blender_artifact_invalid."});
         let params_prop = json!({"type": "object", "description": "Shell parameters (DESIGN §2): width_root, width_tip, thickness (metres, decimal strings), segments_per_point (integer), atlas_tile {atlas_image, uv_rect [u0, v0, u1, v1]}, chain (vertex-group name), mirror_of (optional shell object name)."});
+        let take_prop = json!({"type": "object", "description": "A seahawk.take/v2 artifact (DESIGN-ANIM §1): canonical-JSON envelope with an embedded SHA-256 content hash, bound to one scene by hash. Validated broker-side before any downstream contact; invalid takes refuse with seahawk_blender_artifact_invalid."});
+        let pose_prop = json!({"type": "object", "description": "A seahawk.pose/v2 artifact (DESIGN-ANIM §1.4): a single-frame channel-value slice with an embedded SHA-256 content hash. Validated broker-side before any downstream contact."});
+        let artifacts_prop = json!({"type": "object", "description": "GP stroke artifacts keyed by their content hash, supplying the take's GP track references (DESIGN-ANIM §1.3). Each is validated broker-side and must hash to its key."});
         let path_prop = |what: &str| json!({"type": "string", "description": what});
         let specs: Vec<BlenderToolSpec> = vec![
             (
@@ -709,6 +713,222 @@ impl SeahawkServer {
                         path_prop("Absolute .blend path under a [blender.paths] open root."),
                     )],
                     &["path"],
+                ),
+            ),
+            (
+                "blender.pose_capture",
+                "Captures a pose at one frame: for each channel of the bound actions, the F-curve evaluated mathematically at that frame (the provider never moves the scene's current frame). Returns a seahawk.pose/v2 artifact. Read-class.",
+                schema(
+                    vec![(
+                        "frame",
+                        json!({"type": "integer", "description": "The frame to evaluate at."}),
+                    )],
+                    &["frame"],
+                ),
+            ),
+            (
+                "blender.pose_apply",
+                "Writes a pose artifact's values into the live scene as keys at the pose's frame (scene-hash binding checked before mutation). Write-class (in-memory).",
+                schema(vec![("pose", pose_prop.clone())], &["pose"]),
+            ),
+            (
+                "blender.curve_capture",
+                "Transcribes one channel in full — keys, handles, handle types, easing parameters, extrapolation — into the DESIGN-ANIM §1.2 channel form. Read-class.",
+                schema(
+                    vec![
+                        (
+                            "id_type",
+                            json!({"type": "string", "description": "Channel id type (OBJECT | KEY | GREASE_PENCIL | ...)."}),
+                        ),
+                        (
+                            "id_name",
+                            json!({"type": "string", "description": "Channel id name (the datablock the action binds)."}),
+                        ),
+                        (
+                            "slot",
+                            json!({"type": "string", "description": "Optional action slot identifier."}),
+                        ),
+                        (
+                            "path",
+                            json!({"type": "string", "description": "RNA data path, verbatim (pose.bones[\"...\"].rotation_quaternion, key_blocks[\"...\"].value, location, ...)."}),
+                        ),
+                        (
+                            "index",
+                            json!({"type": "integer", "description": "Array component, 0..=3."}),
+                        ),
+                    ],
+                    &["id_type", "id_name", "path", "index"],
+                ),
+            ),
+            (
+                "blender.curve_apply",
+                "Replaces one channel's keys with an artifact channel's, verbatim: keyframe points are constructed from the data, never through Blender's interactive keying operators. Write-class (in-memory).",
+                schema(
+                    vec![
+                        (
+                            "channel",
+                            json!({"type": "object", "description": "One channel in the DESIGN-ANIM §1.2 form (id, slot, path, index, extrapolation, keys)."}),
+                        ),
+                        (
+                            "scene_sha256",
+                            json!({"type": "string", "description": "The open scene's content hash; the apply refuses on mismatch, before mutation."}),
+                        ),
+                    ],
+                    &["channel", "scene_sha256"],
+                ),
+            ),
+            (
+                "blender.take_capture",
+                "Transcribes the bound scene's authored animation into a seahawk.take/v2 artifact: every channel of every in-scope action/slot plus GP tracks. All-or-named-refusal — motion the schema cannot carry (a driver, an NLA strip, a curve modifier) refuses the capture and is named. Read-class.",
+                schema(
+                    vec![(
+                        "id",
+                        json!({"type": "string", "description": "Optional author-chosen take id (default: capture-<rig>)."}),
+                    )],
+                    &[],
+                ),
+            ),
+            (
+                "blender.take_apply",
+                "Applies a take to its bound scene (hash checked first): constructs/replaces the actions' channel data and replays the GP tracks. Write-class (in-memory; persist with blender.blend_save).",
+                schema(
+                    vec![
+                        ("take", take_prop.clone()),
+                        ("artifacts", artifacts_prop.clone()),
+                    ],
+                    &["take"],
+                ),
+            ),
+            (
+                "blender.take_validate",
+                "Validates a take or pose artifact broker-side (schema, bounds, exclusion set, channel grammar, content hash) without touching the provider. Read-class.",
+                schema(
+                    vec![("take", take_prop.clone()), ("pose", pose_prop.clone())],
+                    &[],
+                ),
+            ),
+            (
+                "blender.gp_capture_range",
+                "Captures every drawing of a named GP (object, layer) over a frame range into a take GP track, emitting the per-frame seahawk.stroke/v1 gp_strokes artifacts alongside. Read-class.",
+                schema(
+                    vec![
+                        (
+                            "object",
+                            json!({"type": "string", "description": "Grease Pencil object name."}),
+                        ),
+                        (
+                            "layer",
+                            json!({"type": "string", "description": "GP layer name."}),
+                        ),
+                        (
+                            "start",
+                            json!({"type": "integer", "description": "First frame of the range (inclusive)."}),
+                        ),
+                        (
+                            "end",
+                            json!({"type": "integer", "description": "Last frame of the range (inclusive)."}),
+                        ),
+                    ],
+                    &["object", "layer", "start", "end"],
+                ),
+            ),
+            (
+                "blender.gp_replay_range",
+                "Replays a take GP track: places each referenced drawing at its frame via the v1 replay path. Write-class (in-memory).",
+                schema(
+                    vec![
+                        (
+                            "track",
+                            json!({"type": "object", "description": "One GP track in the DESIGN-ANIM §1.3 form (object, layer, frames[{frame, artifact}])."}),
+                        ),
+                        ("artifacts", artifacts_prop.clone()),
+                    ],
+                    &["track", "artifacts"],
+                ),
+            ),
+            (
+                "blender.take_render",
+                "Applies a take (hash-checked) and renders its full frame range as a PNG sequence under a policy render root — one gated op, so the frames an eye gate judges are provably the artifact's motion. Execute-class: default-deny — requires policy enablement and a per-call operator token.",
+                schema(
+                    vec![
+                        ("take", take_prop.clone()),
+                        ("artifacts", artifacts_prop.clone()),
+                        (
+                            "path",
+                            path_prop(
+                                "Frame-path prefix under a [blender.paths] render root; frames are written as <path><frame:04>.png.",
+                            ),
+                        ),
+                        (
+                            "width",
+                            json!({"type": "integer", "description": "Optional render width in pixels (default: scene setting)."}),
+                        ),
+                        (
+                            "height",
+                            json!({"type": "integer", "description": "Optional render height in pixels (default: scene setting)."}),
+                        ),
+                    ],
+                    &["take", "path"],
+                ),
+            ),
+            (
+                "blender.contact_sheet",
+                "Composites rendered frames (from a take_render output set, each under a policy render root) onto one sheet image under a policy export root — the eye-gate surface for motion. Execute-class: default-deny — requires policy enablement and a per-call operator token.",
+                schema(
+                    vec![
+                        (
+                            "frames",
+                            json!({"type": "array", "items": {"type": "string"}, "description": "Absolute PNG paths under a [blender.paths] render root, in sheet order (at most 64)."}),
+                        ),
+                        (
+                            "path",
+                            path_prop("Absolute PNG path under a [blender.paths] export root."),
+                        ),
+                        (
+                            "columns",
+                            json!({"type": "integer", "description": "Optional sheet columns (default: ceil(sqrt(frames)))."}),
+                        ),
+                    ],
+                    &["frames", "path"],
+                ),
+            ),
+            (
+                "blender.sim_bake",
+                "Bakes the named objects' evaluated motion over a frame range into per-frame keys, returned in the DESIGN-ANIM §1.2 channel form with the §4.2 bake header. Admission is per (system, scene, settings): the caller runs it twice and the channel-set hashes must agree (§4.3). Execute-class: default-deny — requires policy enablement and a per-call operator token.",
+                schema(
+                    vec![
+                        (
+                            "system",
+                            json!({"type": "string", "description": "What is baked (the sim system or object set label recorded in the bake header)."}),
+                        ),
+                        (
+                            "objects",
+                            json!({"type": "array", "items": {"type": "string"}, "description": "Object names whose evaluated transforms are baked."}),
+                        ),
+                        (
+                            "start",
+                            json!({"type": "integer", "description": "First frame of the range (inclusive)."}),
+                        ),
+                        (
+                            "end",
+                            json!({"type": "integer", "description": "Last frame of the range (inclusive)."}),
+                        ),
+                    ],
+                    &["system", "objects", "start", "end"],
+                ),
+            ),
+            (
+                "blender.take_export",
+                "Transforms a take into the D-1397 timeline compiler's input form (lossless: handles and easing parameters carried in full) and writes it under a policy export root. The transform is computed broker-side; the provider writes the exact document. Execute-class: default-deny — requires policy enablement and a per-call operator token.",
+                schema(
+                    vec![
+                        ("take", take_prop.clone()),
+                        (
+                            "path",
+                            path_prop("Absolute JSON path under a [blender.paths] export root."),
+                        ),
+                    ],
+                    &["take", "path"],
                 ),
             ),
         ];
@@ -851,11 +1071,196 @@ impl SeahawkServer {
                 return Ok(json_result(&report));
             }
         }
+        // Animation-surface pre-checks (DESIGN-ANIM §2): take
+        // and pose artifacts validate broker-side before any
+        // downstream contact, exactly like stroke artifacts.
+        // `take_validate` is broker-local by definition, and
+        // `take_export`'s transform is computed here — the
+        // provider only writes the finished document.
+        let mut dispatch_params: Option<Value> = None;
+        let take_carrying = matches!(
+            canonical,
+            "blender.take_apply" | "blender.take_render" | "blender.take_export"
+        );
+        if take_carrying && args.get("take").and_then(Value::as_object).is_none() {
+            return Err(McpError::invalid_params(
+                format!("{canonical} requires a \"take\" object argument"),
+                None,
+            ));
+        }
+        if let Some(take) = args.get("take").filter(|t| t.is_object())
+            && (take_carrying || canonical == "blender.take_validate")
+        {
+            let info = match crate::take::validate_take(take) {
+                Ok(info) => info,
+                Err(message) => {
+                    return Ok(refuse(
+                        codes::BLENDER_ARTIFACT_INVALID,
+                        &message,
+                        Some(class),
+                    ));
+                }
+            };
+            if canonical == "blender.take_validate" {
+                let report = json!({
+                    "valid": true,
+                    "kind": "take",
+                    "id": info.id,
+                    "sha256": info.sha256,
+                    "channels": info.channels,
+                    "keys": info.keys,
+                    "gp_tracks": info.gp_tracks,
+                    "gp_refs": info.gp_refs,
+                    "baked": info.baked,
+                    "action_digest": crate::take::action_digest(take)
+                        .expect("a validated take digests"),
+                });
+                self.oplog.record_with(
+                    canonical,
+                    Some(class.as_str()),
+                    Some(args),
+                    "ok",
+                    Some(elapsed()),
+                    None,
+                    LogExtra::default(),
+                );
+                return Ok(json_result(&report));
+            }
+            if canonical == "blender.take_export" {
+                let export = match crate::take::export_take(take) {
+                    Ok(export) => export,
+                    Err(message) => {
+                        return Ok(refuse(
+                            codes::BLENDER_ARTIFACT_INVALID,
+                            &message,
+                            Some(class),
+                        ));
+                    }
+                };
+                dispatch_params = Some(json!({
+                    "export": export,
+                    "path": args.get("path").cloned().unwrap_or(Value::Null),
+                }));
+            }
+        }
+        if matches!(canonical, "blender.pose_apply" | "blender.take_validate") {
+            match args.get("pose").filter(|p| p.is_object()) {
+                Some(pose) => {
+                    let info = match crate::take::validate_pose(pose) {
+                        Ok(info) => info,
+                        Err(message) => {
+                            return Ok(refuse(
+                                codes::BLENDER_ARTIFACT_INVALID,
+                                &message,
+                                Some(class),
+                            ));
+                        }
+                    };
+                    if canonical == "blender.take_validate" {
+                        let report = json!({
+                            "valid": true,
+                            "kind": "pose",
+                            "id": info.id,
+                            "sha256": info.sha256,
+                            "channels": info.channels,
+                        });
+                        self.oplog.record_with(
+                            canonical,
+                            Some(class.as_str()),
+                            Some(args),
+                            "ok",
+                            Some(elapsed()),
+                            None,
+                            LogExtra::default(),
+                        );
+                        return Ok(json_result(&report));
+                    }
+                }
+                None => {
+                    if canonical == "blender.pose_apply" {
+                        return Err(McpError::invalid_params(
+                            "blender.pose_apply requires a \"pose\" object argument".to_string(),
+                            None,
+                        ));
+                    }
+                    if args.get("take").filter(|t| t.is_object()).is_none() {
+                        return Err(McpError::invalid_params(
+                            "blender.take_validate requires a \"take\" or \"pose\"                              object argument"
+                                .to_string(),
+                            None,
+                        ));
+                    }
+                }
+            }
+        }
+        if canonical == "blender.gp_replay_range" {
+            // Every referenced drawing must resolve to a
+            // validated artifact whose own hash is its key —
+            // an unresolvable reference refuses before the
+            // downstream is contacted (DESIGN-ANIM §1.3).
+            let (Some(track), Some(artifacts)) = (
+                args.get("track").filter(|t| t.is_object()),
+                args.get("artifacts").filter(|a| a.is_object()),
+            ) else {
+                return Err(McpError::invalid_params(
+                    "blender.gp_replay_range requires \"track\" and \"artifacts\"                      object arguments"
+                        .to_string(),
+                    None,
+                ));
+            };
+            let Some(track_frames) = track.get("frames").and_then(Value::as_array) else {
+                return Err(McpError::invalid_params(
+                    "blender.gp_replay_range track requires a \"frames\" array".to_string(),
+                    None,
+                ));
+            };
+            for entry in track_frames {
+                let Some(hash) = entry.get("artifact").and_then(Value::as_str) else {
+                    return Err(McpError::invalid_params(
+                        "blender.gp_replay_range track frames require an \"artifact\"                          hash"
+                            .to_string(),
+                        None,
+                    ));
+                };
+                let Some(artifact) = artifacts.get(hash) else {
+                    return Ok(refuse(
+                        codes::BLENDER_ARTIFACT_INVALID,
+                        &format!(
+                            "GP track references artifact {hash}, which was not                              supplied (refused before downstream contact,                              DESIGN-ANIM §1.3)"
+                        ),
+                        Some(class),
+                    ));
+                };
+                match crate::stroke::validate_artifact(artifact) {
+                    Ok(info) if info.sha256 == hash => {}
+                    Ok(info) => {
+                        return Ok(refuse(
+                            codes::BLENDER_ARTIFACT_INVALID,
+                            &format!(
+                                "supplied artifact hashes to {}, not to its key {hash}",
+                                info.sha256
+                            ),
+                            Some(class),
+                        ));
+                    }
+                    Err(message) => {
+                        return Ok(refuse(
+                            codes::BLENDER_ARTIFACT_INVALID,
+                            &message,
+                            Some(class),
+                        ));
+                    }
+                }
+            }
+        }
         let path_gate: Option<(&str, BlenderRoot)> = match canonical {
             "blender.scene_open" => Some(("path", BlenderRoot::Open)),
             "blender.blend_save" => Some(("path", BlenderRoot::Save)),
             "blender.image_export_png" => Some(("path", BlenderRoot::Export)),
             "blender.proof_render" => Some(("path", BlenderRoot::Render)),
+            "blender.take_render" => Some(("path", BlenderRoot::Render)),
+            "blender.contact_sheet" => Some(("path", BlenderRoot::Export)),
+            "blender.take_export" => Some(("path", BlenderRoot::Export)),
             _ => None,
         };
         if let Some((field, root)) = path_gate {
@@ -881,6 +1286,43 @@ impl SeahawkServer {
                 ));
             }
         }
+        if canonical == "blender.contact_sheet" {
+            // Every sheet frame must sit under a render root:
+            // the sheet composites provider-rendered frames,
+            // not arbitrary files (DESIGN-ANIM §2 op 23).
+            let Some(frames) = args.get("frames").and_then(Value::as_array) else {
+                return Err(McpError::invalid_params(
+                    "blender.contact_sheet requires a \"frames\" array argument".to_string(),
+                    None,
+                ));
+            };
+            if frames.is_empty() || frames.len() > 64 {
+                return Err(McpError::invalid_params(
+                    "blender.contact_sheet frames must hold 1..=64 paths".to_string(),
+                    None,
+                ));
+            }
+            for frame in frames {
+                let Some(frame_path) = frame.as_str() else {
+                    return Err(McpError::invalid_params(
+                        "blender.contact_sheet frames must be path strings".to_string(),
+                        None,
+                    ));
+                };
+                let allowed = self.config.blender.as_ref().is_some_and(|b| {
+                    b.path_allowed(BlenderRoot::Render, std::path::Path::new(frame_path))
+                });
+                if !allowed {
+                    return Ok(refuse(
+                        codes::BLENDER_PATH_REFUSED,
+                        &format!(
+                            "blender.contact_sheet frame {frame_path:?} is outside                              every policy render root (refused before downstream                              contact)"
+                        ),
+                        Some(class),
+                    ));
+                }
+            }
+        }
         let Some(client) = self.blender.clone() else {
             return Ok(refuse(
                 codes::BLENDER_UNAVAILABLE,
@@ -892,7 +1334,7 @@ impl SeahawkServer {
             .strip_prefix("blender.")
             .expect("canonical names carry the prefix")
             .to_string();
-        let params = args.clone();
+        let params = dispatch_params.unwrap_or_else(|| args.clone());
         let outcome = tokio::task::spawn_blocking(move || client.call(&method, &params, class))
             .await
             .map_err(|e| McpError::internal_error(format!("blender worker join: {e}"), None))?;
@@ -4093,6 +4535,19 @@ mod tests {
             ("blender.proof_render", Some(Pack::Blender)),
             ("blender.blend_save", Some(Pack::Blender)),
             ("blender.scene_open", Some(Pack::Blender)),
+            ("blender.pose_capture", Some(Pack::Blender)),
+            ("blender.pose_apply", Some(Pack::Blender)),
+            ("blender.curve_capture", Some(Pack::Blender)),
+            ("blender.curve_apply", Some(Pack::Blender)),
+            ("blender.take_capture", Some(Pack::Blender)),
+            ("blender.take_apply", Some(Pack::Blender)),
+            ("blender.take_validate", Some(Pack::Blender)),
+            ("blender.gp_capture_range", Some(Pack::Blender)),
+            ("blender.gp_replay_range", Some(Pack::Blender)),
+            ("blender.take_render", Some(Pack::Blender)),
+            ("blender.contact_sheet", Some(Pack::Blender)),
+            ("blender.sim_bake", Some(Pack::Blender)),
+            ("blender.take_export", Some(Pack::Blender)),
             ("code.feedback", Some(Pack::Feedback)),
             ("gui.blender.observe", Some(Pack::Gui)),
             ("gui.blender.actuate", Some(Pack::Gui)),

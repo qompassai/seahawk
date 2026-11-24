@@ -130,8 +130,11 @@ pub fn default_class(tool_name: &str) -> Option<ToolClass> {
     DEFAULT_CLASSES.get(&tool_name.to_lowercase()).copied()
 }
 
-/// The Blender stroke provider's class table (DESIGN §1): the
-/// twelve `blender.*` tools and their classes. Unlike the UE
+/// The Blender stroke provider's class table (DESIGN §1 +
+/// DESIGN-ANIM §2): the twenty-five `blender.*` tools and their
+/// classes — the twelve v1 stroke ops plus the thirteen v2
+/// animation ops (pose/curve/take capture+apply, GP frame
+/// ranges, take render/contact sheet/bake/export). Unlike the UE
 /// surface there is no census — the downstream is authored by
 /// the estate, so this table *is* the surface definition, and
 /// `server.rs` builds the served tools from exactly these names.
@@ -139,7 +142,7 @@ pub fn default_class(tool_name: &str) -> Option<ToolClass> {
 /// compute purely, writes mutate editor-domain state in memory,
 /// executes touch the filesystem. No blender tool is
 /// actuate-class: the data provider never injects input.
-pub const BLENDER_CLASSES: [(&str, ToolClass); 12] = [
+pub const BLENDER_CLASSES: [(&str, ToolClass); 25] = [
     ("blender.session_status", ToolClass::Read),
     ("blender.scene_census", ToolClass::Read),
     ("blender.gp_capture", ToolClass::Read),
@@ -152,10 +155,28 @@ pub const BLENDER_CLASSES: [(&str, ToolClass); 12] = [
     ("blender.proof_render", ToolClass::Execute),
     ("blender.blend_save", ToolClass::Execute),
     ("blender.scene_open", ToolClass::Execute),
+    // DESIGN-ANIM §2, ops 13–25: classification follows reach,
+    // as in v1 — captures and validation observe or compute
+    // purely, applies mutate editor-domain state in memory,
+    // renders/sheets/bakes/exports touch the filesystem or run
+    // the whole dependency graph. None is actuate-class.
+    ("blender.pose_capture", ToolClass::Read),
+    ("blender.pose_apply", ToolClass::Write),
+    ("blender.curve_capture", ToolClass::Read),
+    ("blender.curve_apply", ToolClass::Write),
+    ("blender.take_capture", ToolClass::Read),
+    ("blender.take_apply", ToolClass::Write),
+    ("blender.take_validate", ToolClass::Read),
+    ("blender.gp_capture_range", ToolClass::Read),
+    ("blender.gp_replay_range", ToolClass::Write),
+    ("blender.take_render", ToolClass::Execute),
+    ("blender.contact_sheet", ToolClass::Execute),
+    ("blender.sim_bake", ToolClass::Execute),
+    ("blender.take_export", ToolClass::Execute),
 ];
 
 /// The compiled-in class of a `blender.*` tool, if the name is
-/// one of the twelve provider tools (case-insensitive, matching
+/// one of the twenty-five provider tools (case-insensitive, matching
 /// the server's dispatch discipline for Seahawk-owned names).
 pub fn blender_class(tool_name: &str) -> Option<ToolClass> {
     BLENDER_CLASSES
@@ -164,8 +185,8 @@ pub fn blender_class(tool_name: &str) -> Option<ToolClass> {
         .map(|(_, class)| *class)
 }
 
-/// The canonical names of the twelve provider tools, in table
-/// order.
+/// The canonical names of the twenty-five provider tools, in
+/// table order.
 pub fn blender_tool_names() -> Vec<&'static str> {
     BLENDER_CLASSES.iter().map(|(name, _)| *name).collect()
 }
@@ -273,13 +294,13 @@ mod tests {
 
     #[test]
     fn blender_class_table_matches_the_design_surface() {
-        // DESIGN §1: twelve ops, four read / four write / four
-        // execute, none actuate.
-        assert_eq!(BLENDER_CLASSES.len(), 12);
+        // DESIGN §1 + DESIGN-ANIM §2: twenty-five ops, nine
+        // read / eight write / eight execute, none actuate.
+        assert_eq!(BLENDER_CLASSES.len(), 25);
         let count = |class: ToolClass| BLENDER_CLASSES.iter().filter(|(_, c)| *c == class).count();
-        assert_eq!(count(ToolClass::Read), 4);
-        assert_eq!(count(ToolClass::Write), 4);
-        assert_eq!(count(ToolClass::Execute), 4);
+        assert_eq!(count(ToolClass::Read), 9);
+        assert_eq!(count(ToolClass::Write), 8);
+        assert_eq!(count(ToolClass::Execute), 8);
         assert_eq!(count(ToolClass::Actuate), 0);
         assert_eq!(
             blender_class("blender.blend_save"),
