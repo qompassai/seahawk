@@ -589,52 +589,52 @@ impl SeahawkServer {
             }
             Arc::new(map)
         }
-        let artifact_prop = json!({"type": "object", "description": "A seahawk.stroke/v1 artifact (DESIGN §2): canonical-JSON envelope with an embedded SHA-256 content hash. Validated broker-side before any downstream contact; invalid artifacts refuse with seahawk_blender_artifact_invalid."});
-        let params_prop = json!({"type": "object", "description": "Shell parameters (DESIGN §2): width_root, width_tip, thickness (metres, decimal strings), segments_per_point (integer), atlas_tile {atlas_image, uv_rect [u0, v0, u1, v1]}, chain (vertex-group name), mirror_of (optional shell object name)."});
-        let take_prop = json!({"type": "object", "description": "A seahawk.take/v2 artifact (DESIGN-ANIM §1): canonical-JSON envelope with an embedded SHA-256 content hash, bound to one scene by hash. Validated broker-side before any downstream contact; invalid takes refuse with seahawk_blender_artifact_invalid."});
-        let pose_prop = json!({"type": "object", "description": "A seahawk.pose/v2 artifact (DESIGN-ANIM §1.4): a single-frame channel-value slice with an embedded SHA-256 content hash. Validated broker-side before any downstream contact."});
-        let artifacts_prop = json!({"type": "object", "description": "GP stroke artifacts keyed by their content hash, supplying the take's GP track references (DESIGN-ANIM §1.3). Each is validated broker-side and must hash to its key."});
+        let artifact_prop = json!({"type": "object", "description": "seahawk.stroke/v1 artifact (DESIGN §2): canonical-JSON envelope, embedded SHA-256. Validated broker-side before downstream contact; invalid refuses seahawk_blender_artifact_invalid."});
+        let params_prop = json!({"type": "object", "description": "Shell parameters (DESIGN §2): width_root, width_tip, thickness (metres, decimal strings), segments_per_point (int), atlas_tile {atlas_image, uv_rect [u0, v0, u1, v1]}, chain (vertex-group name), mirror_of (optional shell object)."});
+        let take_prop = json!({"type": "object", "description": "seahawk.take/v2 artifact (DESIGN-ANIM §1): canonical-JSON envelope, embedded SHA-256, bound to one scene by hash. Validated broker-side before downstream contact; invalid refuses seahawk_blender_artifact_invalid."});
+        let pose_prop = json!({"type": "object", "description": "seahawk.pose/v2 artifact (DESIGN-ANIM §1.4): single-frame channel-value slice, embedded SHA-256. Validated broker-side before downstream contact."});
+        let artifacts_prop = json!({"type": "object", "description": "GP stroke artifacts keyed by content hash, supplying the take's GP track references (DESIGN-ANIM §1.3); each validated broker-side, must hash to its key."});
         let path_prop = |what: &str| json!({"type": "string", "description": what});
         let specs: Vec<BlenderToolSpec> = vec![
             (
                 "blender.session_status",
-                "Provider session status: the Blender build string (the pinned-build gate reads it), provider version, and whether a scene is open. Read-class.",
+                "Provider session status: Blender build string (the pinned-build gate reads it), provider version, scene open or not. Read-class.",
                 schema(vec![], &[]),
             ),
             (
                 "blender.scene_census",
-                "The estate mesh census of the open scene: per-object vertex/face counts and the estate content digest over vertex data. Read-class.",
+                "Mesh census of the open scene: per-object vertex/face counts + estate content digest over vertex data. Read-class.",
                 schema(vec![], &[]),
             ),
             (
                 "blender.gp_capture",
-                "Captures a Grease Pencil object's strokes as a seahawk.stroke/v1 gp_strokes artifact (object-local metres, 6-decimal strings, content hash). Read-class.",
+                "Capture a Grease Pencil object's strokes as a seahawk.stroke/v1 gp_strokes artifact (object-local metres, 6-decimal strings, content hash). Read-class.",
                 schema(
                     vec![(
                         "object",
-                        json!({"type": "string", "description": "Grease Pencil object name in the open scene."}),
+                        json!({"type": "string", "description": "Grease Pencil object name."}),
                     )],
                     &["object"],
                 ),
             ),
             (
                 "blender.artifact_validate",
-                "Validates a stroke artifact broker-side (schema, bounds, exclusion set, content hash) without touching the provider. Read-class.",
+                "Validate a stroke artifact broker-side (schema, bounds, exclusion set, content hash); never touches the provider. Read-class.",
                 schema(vec![("artifact", artifact_prop.clone())], &["artifact"]),
             ),
             (
                 "blender.gp_replay",
-                "Replays a gp_strokes artifact into the scene as a Grease Pencil object named by the artifact target. Deterministic: replaying the same artifact yields the same strokes. Write-class (in-memory).",
+                "Replay a gp_strokes artifact into the scene as the Grease Pencil object its target names. Deterministic: same artifact, same strokes. Write-class (in-memory).",
                 schema(vec![("artifact", artifact_prop.clone())], &["artifact"]),
             ),
             (
                 "blender.paint_apply",
-                "Applies a paint_batch artifact to the target image with the provider's own rasterizer (round dabs, fixed spacing — the same batch always yields the same pixels). Write-class (in-memory; persist with blender.image_export_png).",
+                "Apply a paint_batch artifact to the target image with the provider's rasterizer (round dabs, fixed spacing — same batch, same pixels). Write-class (in-memory; persist with blender.image_export_png).",
                 schema(vec![("artifact", artifact_prop.clone())], &["artifact"]),
             ),
             (
                 "blender.stroke_to_shell",
-                "Converts each stroke of a flow_curves artifact into one closed hair-shell mesh (fixed arc-length resample, parallel-transport frames, UVs mapped onto the atlas tile). Write-class (in-memory).",
+                "Convert each stroke of a flow_curves artifact into one closed hair-shell mesh (fixed arc-length resample, parallel-transport frames, UVs on the atlas tile). Write-class (in-memory).",
                 schema(
                     vec![
                         ("artifact", artifact_prop.clone()),
@@ -645,7 +645,7 @@ impl SeahawkServer {
             ),
             (
                 "blender.shells_along_flow",
-                "Places shells along each flow curve of a flow_curves artifact: roots spaced along the curve, shells following its sub-arcs. Write-class (in-memory).",
+                "Place shells along each flow curve of a flow_curves artifact: roots spaced along the curve, shells following its sub-arcs. Write-class (in-memory).",
                 schema(
                     vec![("artifact", artifact_prop.clone()), ("params", params_prop)],
                     &["artifact", "params"],
@@ -653,7 +653,7 @@ impl SeahawkServer {
             ),
             (
                 "blender.image_export_png",
-                "Exports a named image datablock to a PNG file under a policy export root. Execute-class: default-deny — requires policy enablement and a per-call operator token.",
+                "Export a named image datablock to a PNG under a policy export root. Execute-class.",
                 schema(
                     vec![
                         (
@@ -670,7 +670,7 @@ impl SeahawkServer {
             ),
             (
                 "blender.proof_render",
-                "Renders the open scene to a PNG under a policy render root (estate proof discipline: fixed engine settings from the scene). Execute-class: default-deny — requires policy enablement and a per-call operator token.",
+                "Render the open scene to a PNG under a policy render root (fixed engine settings from the scene). Execute-class.",
                 schema(
                     vec![
                         (
@@ -679,15 +679,15 @@ impl SeahawkServer {
                         ),
                         (
                             "width",
-                            json!({"type": "integer", "description": "Optional render width in pixels (default: scene setting)."}),
+                            json!({"type": "integer", "description": "Render width px (default: scene setting)."}),
                         ),
                         (
                             "height",
-                            json!({"type": "integer", "description": "Optional render height in pixels (default: scene setting)."}),
+                            json!({"type": "integer", "description": "Render height px (default: scene setting)."}),
                         ),
                         (
                             "camera",
-                            json!({"type": "string", "description": "Optional camera object name (default: scene camera)."}),
+                            json!({"type": "string", "description": "Camera object name (default: scene camera)."}),
                         ),
                     ],
                     &["path"],
@@ -695,7 +695,7 @@ impl SeahawkServer {
             ),
             (
                 "blender.blend_save",
-                "Saves the working scene to an explicit .blend path under a policy save root. There is no save-in-place: the opened file is never the save target unless policy lists its directory and the caller names it. Execute-class: default-deny — requires policy enablement and a per-call operator token.",
+                "Save the working scene to an explicit .blend path under a policy save root. No save-in-place: the opened file is a save target only if policy lists its directory and the caller names it. Execute-class.",
                 schema(
                     vec![(
                         "path",
@@ -706,7 +706,7 @@ impl SeahawkServer {
             ),
             (
                 "blender.scene_open",
-                "Opens a .blend file under a policy open root as the provider's working scene (a load, classified execute per the UE census precedent). Execute-class: default-deny — requires policy enablement and a per-call operator token.",
+                "Open a .blend under a policy open root as the provider's working scene (a load; execute per the UE census precedent). Execute-class.",
                 schema(
                     vec![(
                         "path",
@@ -717,23 +717,23 @@ impl SeahawkServer {
             ),
             (
                 "blender.pose_capture",
-                "Captures a pose at one frame: for each channel of the bound actions, the F-curve evaluated mathematically at that frame (the provider never moves the scene's current frame). Returns a seahawk.pose/v2 artifact. Read-class.",
+                "Capture a pose at one frame: each bound action's channels, F-curves evaluated mathematically at that frame (the scene's current frame never moves). Returns a seahawk.pose/v2 artifact. Read-class.",
                 schema(
                     vec![(
                         "frame",
-                        json!({"type": "integer", "description": "The frame to evaluate at."}),
+                        json!({"type": "integer", "description": "Frame to evaluate."}),
                     )],
                     &["frame"],
                 ),
             ),
             (
                 "blender.pose_apply",
-                "Writes a pose artifact's values into the live scene as keys at the pose's frame (scene-hash binding checked before mutation). Write-class (in-memory).",
+                "Write a pose artifact's values into the live scene as keys at the pose's frame (scene-hash binding checked before mutation). Write-class (in-memory).",
                 schema(vec![("pose", pose_prop.clone())], &["pose"]),
             ),
             (
                 "blender.curve_capture",
-                "Transcribes one channel in full — keys, handles, handle types, easing parameters, extrapolation — into the DESIGN-ANIM §1.2 channel form. Read-class.",
+                "Transcribe one channel in full — keys, handles, handle types, easing, extrapolation — into the DESIGN-ANIM §1.2 channel form. Read-class.",
                 schema(
                     vec![
                         (
@@ -746,7 +746,7 @@ impl SeahawkServer {
                         ),
                         (
                             "slot",
-                            json!({"type": "string", "description": "Optional action slot identifier."}),
+                            json!({"type": "string", "description": "Action slot identifier (optional)."}),
                         ),
                         (
                             "path",
@@ -762,16 +762,16 @@ impl SeahawkServer {
             ),
             (
                 "blender.curve_apply",
-                "Replaces one channel's keys with an artifact channel's, verbatim: keyframe points are constructed from the data, never through Blender's interactive keying operators. Write-class (in-memory).",
+                "Replace one channel's keys with an artifact channel's, verbatim: keyframe points are constructed from the data, never through Blender's keying operators. Write-class (in-memory).",
                 schema(
                     vec![
                         (
                             "channel",
-                            json!({"type": "object", "description": "One channel in the DESIGN-ANIM §1.2 form (id, slot, path, index, extrapolation, keys)."}),
+                            json!({"type": "object", "description": "One DESIGN-ANIM §1.2 channel (id, slot, path, index, extrapolation, keys)."}),
                         ),
                         (
                             "scene_sha256",
-                            json!({"type": "string", "description": "The open scene's content hash; the apply refuses on mismatch, before mutation."}),
+                            json!({"type": "string", "description": "Open scene's content hash; apply refuses on mismatch, before mutation."}),
                         ),
                     ],
                     &["channel", "scene_sha256"],
@@ -779,18 +779,18 @@ impl SeahawkServer {
             ),
             (
                 "blender.take_capture",
-                "Transcribes the bound scene's authored animation into a seahawk.take/v2 artifact: every channel of every in-scope action/slot plus GP tracks. All-or-named-refusal — motion the schema cannot carry (a driver, an NLA strip, a curve modifier) refuses the capture and is named. Read-class.",
+                "Transcribe the bound scene's authored animation into a seahawk.take/v2 artifact: every channel of every in-scope action/slot + GP tracks. All-or-named-refusal: motion the schema cannot carry (driver, NLA strip, curve modifier) refuses the capture and is named. Read-class.",
                 schema(
                     vec![(
                         "id",
-                        json!({"type": "string", "description": "Optional author-chosen take id (default: capture-<rig>)."}),
+                        json!({"type": "string", "description": "Take id (default: capture-<rig>)."}),
                     )],
                     &[],
                 ),
             ),
             (
                 "blender.take_apply",
-                "Applies a take to its bound scene (hash checked first): constructs/replaces the actions' channel data and replays the GP tracks. Write-class (in-memory; persist with blender.blend_save).",
+                "Apply a take to its bound scene (hash checked first): construct/replace the actions' channel data, replay the GP tracks. Write-class (in-memory; persist with blender.blend_save).",
                 schema(
                     vec![
                         ("take", take_prop.clone()),
@@ -801,7 +801,7 @@ impl SeahawkServer {
             ),
             (
                 "blender.take_validate",
-                "Validates a take or pose artifact broker-side (schema, bounds, exclusion set, channel grammar, content hash) without touching the provider. Read-class.",
+                "Validate a take or pose artifact broker-side (schema, bounds, exclusion set, channel grammar, content hash); never touches the provider. Read-class.",
                 schema(
                     vec![("take", take_prop.clone()), ("pose", pose_prop.clone())],
                     &[],
@@ -809,7 +809,7 @@ impl SeahawkServer {
             ),
             (
                 "blender.gp_capture_range",
-                "Captures every drawing of a named GP (object, layer) over a frame range into a take GP track, emitting the per-frame seahawk.stroke/v1 gp_strokes artifacts alongside. Read-class.",
+                "Capture every drawing of a named GP (object, layer) over a frame range into a take GP track, emitting the per-frame seahawk.stroke/v1 gp_strokes artifacts alongside. Read-class.",
                 schema(
                     vec![
                         (
@@ -822,11 +822,11 @@ impl SeahawkServer {
                         ),
                         (
                             "start",
-                            json!({"type": "integer", "description": "First frame of the range (inclusive)."}),
+                            json!({"type": "integer", "description": "First frame (inclusive)."}),
                         ),
                         (
                             "end",
-                            json!({"type": "integer", "description": "Last frame of the range (inclusive)."}),
+                            json!({"type": "integer", "description": "Last frame (inclusive)."}),
                         ),
                     ],
                     &["object", "layer", "start", "end"],
@@ -834,12 +834,12 @@ impl SeahawkServer {
             ),
             (
                 "blender.gp_replay_range",
-                "Replays a take GP track: places each referenced drawing at its frame via the v1 replay path. Write-class (in-memory).",
+                "Replay a take GP track: place each referenced drawing at its frame via the v1 replay path. Write-class (in-memory).",
                 schema(
                     vec![
                         (
                             "track",
-                            json!({"type": "object", "description": "One GP track in the DESIGN-ANIM §1.3 form (object, layer, frames[{frame, artifact}])."}),
+                            json!({"type": "object", "description": "One DESIGN-ANIM §1.3 GP track (object, layer, frames[{frame, artifact}])."}),
                         ),
                         ("artifacts", artifacts_prop.clone()),
                     ],
@@ -848,7 +848,7 @@ impl SeahawkServer {
             ),
             (
                 "blender.take_render",
-                "Applies a take (hash-checked) and renders its full frame range as a PNG sequence under a policy render root — one gated op, so the frames an eye gate judges are provably the artifact's motion. Execute-class: default-deny — requires policy enablement and a per-call operator token.",
+                "Apply a take (hash-checked) and render its full frame range as a PNG sequence under a policy render root — one gated op, so the frames an eye gate judges are provably the artifact's motion. Execute-class.",
                 schema(
                     vec![
                         ("take", take_prop.clone()),
@@ -861,11 +861,11 @@ impl SeahawkServer {
                         ),
                         (
                             "width",
-                            json!({"type": "integer", "description": "Optional render width in pixels (default: scene setting)."}),
+                            json!({"type": "integer", "description": "Render width px (default: scene setting)."}),
                         ),
                         (
                             "height",
-                            json!({"type": "integer", "description": "Optional render height in pixels (default: scene setting)."}),
+                            json!({"type": "integer", "description": "Render height px (default: scene setting)."}),
                         ),
                     ],
                     &["take", "path"],
@@ -873,12 +873,12 @@ impl SeahawkServer {
             ),
             (
                 "blender.contact_sheet",
-                "Composites rendered frames (from a take_render output set, each under a policy render root) onto one sheet image under a policy export root — the eye-gate surface for motion. Execute-class: default-deny — requires policy enablement and a per-call operator token.",
+                "Composite rendered frames (a take_render output set, each under a policy render root) onto one sheet image under a policy export root — the eye-gate surface for motion. Execute-class.",
                 schema(
                     vec![
                         (
                             "frames",
-                            json!({"type": "array", "items": {"type": "string"}, "description": "Absolute PNG paths under a [blender.paths] render root, in sheet order (at most 64)."}),
+                            json!({"type": "array", "items": {"type": "string"}, "description": "PNG paths under a [blender.paths] render root, in sheet order (max 64)."}),
                         ),
                         (
                             "path",
@@ -886,7 +886,7 @@ impl SeahawkServer {
                         ),
                         (
                             "columns",
-                            json!({"type": "integer", "description": "Optional sheet columns (default: ceil(sqrt(frames)))."}),
+                            json!({"type": "integer", "description": "Sheet columns (default: ceil(sqrt(frames)))."}),
                         ),
                     ],
                     &["frames", "path"],
@@ -894,12 +894,12 @@ impl SeahawkServer {
             ),
             (
                 "blender.sim_bake",
-                "Bakes the named objects' evaluated motion over a frame range into per-frame keys, returned in the DESIGN-ANIM §1.2 channel form with the §4.2 bake header. Admission is per (system, scene, settings): the caller runs it twice and the channel-set hashes must agree (§4.3). Execute-class: default-deny — requires policy enablement and a per-call operator token.",
+                "Bake the named objects' evaluated motion over a frame range into per-frame keys, returned in DESIGN-ANIM §1.2 channel form with the §4.2 bake header. Admission is per (system, scene, settings): run it twice; the channel-set hashes must agree (§4.3). Execute-class.",
                 schema(
                     vec![
                         (
                             "system",
-                            json!({"type": "string", "description": "What is baked (the sim system or object set label recorded in the bake header)."}),
+                            json!({"type": "string", "description": "What is baked (sim system / object-set label recorded in the bake header)."}),
                         ),
                         (
                             "objects",
@@ -907,11 +907,11 @@ impl SeahawkServer {
                         ),
                         (
                             "start",
-                            json!({"type": "integer", "description": "First frame of the range (inclusive)."}),
+                            json!({"type": "integer", "description": "First frame (inclusive)."}),
                         ),
                         (
                             "end",
-                            json!({"type": "integer", "description": "Last frame of the range (inclusive)."}),
+                            json!({"type": "integer", "description": "Last frame (inclusive)."}),
                         ),
                     ],
                     &["system", "objects", "start", "end"],
@@ -919,7 +919,7 @@ impl SeahawkServer {
             ),
             (
                 "blender.take_export",
-                "Transforms a take into the D-1397 timeline compiler's input form (lossless: handles and easing parameters carried in full) and writes it under a policy export root. The transform is computed broker-side; the provider writes the exact document. Execute-class: default-deny — requires policy enablement and a per-call operator token.",
+                "Transform a take into the D-1397 timeline compiler's input form (lossless: handles and easing carried in full), written under a policy export root. Transform computed broker-side; the provider writes the exact document. Execute-class.",
                 schema(
                     vec![
                         ("take", take_prop.clone()),
