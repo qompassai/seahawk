@@ -47,7 +47,7 @@ import bpy
 from mathutils import Quaternion, Vector
 
 PROVIDER_NAME = "seahawk-stroke-provider"
-PROVIDER_VERSION = "1.1.0"
+PROVIDER_VERSION = "1.2.0"
 SCHEMA = "seahawk.stroke/v1"
 
 # Artifact bounds (DESIGN §2): refused, never truncated.
@@ -751,6 +751,17 @@ MAX_GP_TRACKS = 64
 MAX_GP_REFS_TOTAL = 3600
 MAX_POSE_CHANNELS = 4096
 MAX_ID_CHARS = 128
+
+RIGBUILD_SCHEMA = "seahawk.rigbuild/v1"
+MAX_RIG_BONES = 512
+MAX_RIG_CONSTRAINTS = 512
+MAX_RIG_WEIGHT_GROUPS = 256
+MAX_RIG_VERTICES = 200000
+RIG_CONSTRAINT_TYPES = {
+    "IK", "COPY_LOCATION", "COPY_ROTATION", "COPY_SCALE",
+    "DAMPED_TRACK", "TRACK_TO", "LIMIT_LOCATION", "LIMIT_ROTATION",
+    "LIMIT_SCALE",
+}
 MAX_NAME_CHARS = 256
 
 INTERPS = {
@@ -1748,6 +1759,217 @@ def pose_apply(params):
             "channels": info["channels"]}
 
 
+def validate_rigbuild(envelope):
+    """Mirror of src/take.rs validate_rigbuild: returns an info dict."""
+    if not isinstance(envelope, dict):
+        raise ProviderError("rigbuild must be a JSON object")
+    excluded = _find_excluded_v2(envelope)
+    if excluded is not None:
+        raise ProviderError(
+            "rigbuild carries excluded construct %r (DESIGN-ANIM §3)" % excluded)
+    _check_keys(
+        envelope,
+        {"schema", "id", "created_by", "target", "bones", "constraints",
+         "weights", "sha256"},
+        "rigbuild",
+    )
+    if envelope.get("schema") != RIGBUILD_SCHEMA:
+        raise ProviderError("rigbuild.schema must be %r" % RIGBUILD_SCHEMA)
+    _required_string(envelope, "id", "rigbuild", MAX_ID_CHARS)
+    _check_scene_target(envelope, "rigbuild", {"scene_sha256", "armature"})
+    target = envelope["target"]
+    _required_string(target, "armature", "rigbuild.target")
+    bones = envelope.get("bones")
+    if not isinstance(bones, list):
+        raise ProviderError("rigbuild.bones must be an array")
+    if len(bones) > MAX_RIG_BONES:
+        raise ProviderError(
+            "rigbuild carries %d bones; the bound is %d (refused, not "
+            "truncated)" % (len(bones), MAX_RIG_BONES))
+    names = set()
+    for index, bone in enumerate(bones):
+        what = "rigbuild.bones[%d]" % index
+        if not isinstance(bone, dict):
+            raise ProviderError("%s must be an object" % what)
+        _check_keys(bone, {"name", "parent", "head", "tail", "roll", "deform"}, what)
+        _required_string(bone, "name", what)
+        if bone["name"] in names:
+            raise ProviderError("rigbuild carries bone %r twice" % bone["name"])
+        names.add(bone["name"])
+        parent = bone.get("parent")
+        if parent is not None and not isinstance(parent, str):
+            raise ProviderError("%s.parent must be a string or null" % what)
+        for axis in ("head", "tail"):
+            vec = bone.get(axis)
+            if not isinstance(vec, list) or len(vec) != 3 \
+                    or not all(_is_dec6(c) for c in vec):
+                raise ProviderError(
+                    "%s.%s must be three 6-decimal strings (D2)" % (what, axis))
+        if not _is_dec6(bone.get("roll")):
+            raise ProviderError("%s.roll must be a 6-decimal string (D2)" % what)
+        if not isinstance(bone.get("deform"), bool):
+            raise ProviderError("%s.deform must be a boolean" % what)
+    constraints = envelope.get("constraints")
+    if not isinstance(constraints, list):
+        raise ProviderError("rigbuild.constraints must be an array")
+    if len(constraints) > MAX_RIG_CONSTRAINTS:
+        raise ProviderError(
+            "rigbuild carries %d constraints; the bound is %d"
+            % (len(constraints), MAX_RIG_CONSTRAINTS))
+    for index, con in enumerate(constraints):
+        what = "rigbuild.constraints[%d]" % index
+        if not isinstance(con, dict):
+            raise ProviderError("%s must be an object" % what)
+        _check_keys(con, {"bone", "type", "name", "target", "subtarget",
+                          "chain_count", "influence"}, what)
+        _required_string(con, "bone", what)
+        if con.get("type") not in RIG_CONSTRAINT_TYPES:
+            raise ProviderError(
+                "%s.type must be one of %s"
+                % (what, ", ".join(sorted(RIG_CONSTRAINT_TYPES))))
+        name = con.get("name")
+        if name is not None and not isinstance(name, str):
+            raise ProviderError("%s.name must be a string or null" % what)
+        tgt = con.get("target")
+        if tgt is not None:
+            if not isinstance(tgt, dict):
+                raise ProviderError("%s.target must be an object or null" % what)
+            _check_keys(tgt, {"type", "name"}, what + ".target")
+            if tgt.get("type") != "OBJECT" \
+                    or not isinstance(tgt.get("name"), str) or not tgt["name"]:
+                raise ProviderError(
+                    "%s.target must name an object (type OBJECT)" % what)
+        if not isinstance(con.get("subtarget"), str):
+            raise ProviderError("%s.subtarget must be a string" % what)
+        chain_count = con.get("chain_count")
+        if chain_count is not None and (
+                not isinstance(chain_count, int)
+                or isinstance(chain_count, bool)
+                or chain_count < 0 or chain_count > 32):
+            raise ProviderError(
+                "%s.chain_count must be null or an integer in [0, 32]" % what)
+        if not _is_dec6(con.get("influence")):
+            raise ProviderError(
+                "%s.influence must be a 6-decimal string (D2)" % what)
+    weights = envelope.get("weights")
+    if not isinstance(weights, list):
+        raise ProviderError("rigbuild.weights must be an array")
+    if len(weights) > MAX_RIG_WEIGHT_GROUPS:
+        raise ProviderError(
+            "rigbuild carries %d weight groups; the bound is %d"
+            % (len(weights), MAX_RIG_WEIGHT_GROUPS))
+    total_vertices = 0
+    for index, group in enumerate(weights):
+        what = "rigbuild.weights[%d]" % index
+        if not isinstance(group, dict):
+            raise ProviderError("%s must be an object" % what)
+        _check_keys(group, {"mesh", "group", "vertices", "weight"}, what)
+        _required_string(group, "mesh", what)
+        _required_string(group, "group", what)
+        vertices = group.get("vertices")
+        if not isinstance(vertices, list) \
+                or not all(isinstance(v, int) and not isinstance(v, bool) and v >= 0
+                           for v in vertices):
+            raise ProviderError(
+                "%s.vertices must be an array of non-negative integers" % what)
+        if len(set(vertices)) != len(vertices):
+            raise ProviderError("%s.vertices carries a vertex twice" % what)
+        total_vertices += len(vertices)
+        if not _is_dec6(group.get("weight")):
+            raise ProviderError(
+                "%s.weight must be a 6-decimal string (D2)" % what)
+        weight_value = float(group["weight"])
+        if weight_value < 0.0 or weight_value > 1.0:
+            raise ProviderError("%s.weight must lie in [0, 1]" % what)
+    if total_vertices > MAX_RIG_VERTICES:
+        raise ProviderError(
+            "rigbuild weights %d vertices in total; the bound is %d"
+            % (total_vertices, MAX_RIG_VERTICES))
+    if not bones and not constraints and not weights:
+        raise ProviderError(
+            "rigbuild carries no bones, constraints, or weights; "
+            "an empty build is refused")
+    _check_envelope_hash(envelope, "rigbuild")
+    return {"id": envelope["id"], "sha256": envelope["sha256"],
+            "bones": len(bones), "constraints": len(constraints),
+            "weight_groups": len(weights), "vertices": total_vertices}
+
+
+def rig_apply(params):
+    doc = params.get("rigbuild")
+    info = validate_rigbuild(doc)
+    _check_scene_binding(doc["target"]["scene_sha256"])
+    arm_name = doc["target"]["armature"]
+    arm_obj = bpy.data.objects.get(arm_name)
+    if arm_obj is None or arm_obj.type != "ARMATURE":
+        raise ProviderError("no armature object %r in the open scene" % arm_name)
+    bones_created = 0
+    if doc["bones"]:
+        bpy.context.view_layer.objects.active = arm_obj
+        arm_obj.select_set(True)
+        bpy.ops.object.mode_set(mode="EDIT")
+        try:
+            edit_bones = arm_obj.data.edit_bones
+            for bone in doc["bones"]:
+                if edit_bones.get(bone["name"]) is not None:
+                    raise ProviderError(
+                        "bone %r already exists on %r; rigbuild creates, "
+                        "it does not overwrite" % (bone["name"], arm_name))
+                eb = edit_bones.new(bone["name"])
+                eb.head = [float(c) for c in bone["head"]]
+                eb.tail = [float(c) for c in bone["tail"]]
+                eb.roll = float(bone["roll"])
+                eb.use_deform = bone["deform"]
+                if bone["parent"] is not None:
+                    parent = edit_bones.get(bone["parent"])
+                    if parent is None:
+                        raise ProviderError(
+                            "parent bone %r does not exist on %r"
+                            % (bone["parent"], arm_name))
+                    eb.parent = parent
+                bones_created += 1
+        finally:
+            bpy.ops.object.mode_set(mode="OBJECT")
+    constraints_added = 0
+    for con in doc["constraints"]:
+        pose_bone = arm_obj.pose.bones.get(con["bone"])
+        if pose_bone is None:
+            raise ProviderError(
+                "constraint target bone %r does not exist on %r"
+                % (con["bone"], arm_name))
+        created = pose_bone.constraints.new(con["type"])
+        if con["name"]:
+            created.name = con["name"]
+        if con["target"] is not None:
+            target_obj = bpy.data.objects.get(con["target"]["name"])
+            if target_obj is None:
+                raise ProviderError(
+                    "constraint target object %r does not exist"
+                    % con["target"]["name"])
+            created.target = target_obj
+        if con["subtarget"]:
+            created.subtarget = con["subtarget"]
+        if con["chain_count"] is not None and hasattr(created, "chain_count"):
+            created.chain_count = con["chain_count"]
+        created.influence = float(con["influence"])
+        constraints_added += 1
+    vertices_weighted = 0
+    for group in doc["weights"]:
+        mesh_obj = bpy.data.objects.get(group["mesh"])
+        if mesh_obj is None or mesh_obj.type != "MESH":
+            raise ProviderError("no mesh object %r in the open scene" % group["mesh"])
+        vg = mesh_obj.vertex_groups.get(group["group"])
+        if vg is None:
+            vg = mesh_obj.vertex_groups.new(name=group["group"])
+        vg.add(group["vertices"], float(group["weight"]), "REPLACE")
+        vertices_weighted += len(group["vertices"])
+    bpy.context.view_layer.update()
+    return {"id": info["id"], "bones_created": bones_created,
+            "constraints_added": constraints_added,
+            "weight_groups": len(doc["weights"]),
+            "vertices_weighted": vertices_weighted}
+
+
 def curve_capture(params):
     id_type = params.get("id_type")
     id_name = params.get("id_name")
@@ -2420,6 +2642,9 @@ class Provider:
     def pose_apply(self, params):
         return pose_apply(params)
 
+    def rig_apply(self, params):
+        return rig_apply(params)
+
     def curve_capture(self, params):
         return curve_capture(params)
 
@@ -2468,6 +2693,7 @@ class Provider:
         "scene_open": scene_open,
         "pose_capture": pose_capture,
         "pose_apply": pose_apply,
+        "rig_apply": rig_apply,
         "curve_capture": curve_capture,
         "curve_apply": curve_apply,
         "take_capture": take_capture,

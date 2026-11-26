@@ -142,7 +142,7 @@ pub fn default_class(tool_name: &str) -> Option<ToolClass> {
 /// compute purely, writes mutate editor-domain state in memory,
 /// executes touch the filesystem. No blender tool is
 /// actuate-class: the data provider never injects input.
-pub const BLENDER_CLASSES: [(&str, ToolClass); 25] = [
+pub const BLENDER_CLASSES: [(&str, ToolClass); 26] = [
     ("blender.session_status", ToolClass::Read),
     ("blender.scene_census", ToolClass::Read),
     ("blender.gp_capture", ToolClass::Read),
@@ -166,6 +166,7 @@ pub const BLENDER_CLASSES: [(&str, ToolClass); 25] = [
     ("blender.curve_apply", ToolClass::Write),
     ("blender.take_capture", ToolClass::Read),
     ("blender.take_apply", ToolClass::Write),
+    ("blender.rig_apply", ToolClass::Write),
     ("blender.take_validate", ToolClass::Read),
     ("blender.gp_capture_range", ToolClass::Read),
     ("blender.gp_replay_range", ToolClass::Write),
@@ -370,12 +371,13 @@ mod tests {
 
     #[test]
     fn blender_class_table_matches_the_design_surface() {
-        // DESIGN §1 + DESIGN-ANIM §2: twenty-five ops, nine
-        // read / eight write / eight execute, none actuate.
-        assert_eq!(BLENDER_CLASSES.len(), 25);
+        // DESIGN §1 + DESIGN-ANIM §2 + rigbuild: twenty-six
+        // ops, nine read / nine write / eight execute, none
+        // actuate.
+        assert_eq!(BLENDER_CLASSES.len(), 26);
         let count = |class: ToolClass| BLENDER_CLASSES.iter().filter(|(_, c)| *c == class).count();
         assert_eq!(count(ToolClass::Read), 9);
-        assert_eq!(count(ToolClass::Write), 8);
+        assert_eq!(count(ToolClass::Write), 9);
         assert_eq!(count(ToolClass::Execute), 8);
         assert_eq!(count(ToolClass::Actuate), 0);
         assert_eq!(

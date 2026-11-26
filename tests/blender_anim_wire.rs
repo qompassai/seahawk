@@ -34,7 +34,7 @@ const CORE: [&str; 4] = [
     "target.list",
 ];
 
-const BLENDER_TOOLS: [&str; 25] = [
+const BLENDER_TOOLS: [&str; 26] = [
     "blender.artifact_validate",
     "blender.blend_save",
     "blender.contact_sheet",
@@ -49,6 +49,7 @@ const BLENDER_TOOLS: [&str; 25] = [
     "blender.pose_apply",
     "blender.pose_capture",
     "blender.proof_render",
+    "blender.rig_apply",
     "blender.scene_census",
     "blender.scene_open",
     "blender.session_status",
@@ -156,6 +157,7 @@ fn handle_connection(
         }),
         "take_apply" => json!({"applied": true, "channels": 1}),
         "pose_apply" => json!({"applied": true}),
+        "rig_apply" => json!({"applied": true, "bones_created": 1}),
         "pose_capture" => json!({"pose": {"schema": "seahawk.pose/v2", "id": "mock-pose"}}),
         "take_render" => json!({"frames": ["f0001.png"], "count": 1}),
         "take_export" => {
@@ -433,6 +435,33 @@ fn valid_take() -> Value {
     take
 }
 
+fn valid_rigbuild() -> Value {
+    let mut doc = json!({
+        "schema": "seahawk.rigbuild/v1",
+        "id": "wire-rigbuild-1",
+        "created_by": "blender_anim_wire test",
+        "target": {"scene_sha256": SCENE, "armature": "Rig"},
+        "bones": [{
+            "name": "Hair_01", "parent": "Head",
+            "head": ["0.000000", "0.100000", "1.600000"],
+            "tail": ["0.000000", "0.160000", "1.520000"],
+            "roll": "0.000000", "deform": true
+        }],
+        "constraints": [{
+            "bone": "Hair_01", "type": "DAMPED_TRACK", "name": null,
+            "target": null, "subtarget": "", "chain_count": null,
+            "influence": "1.000000"
+        }],
+        "weights": [{
+            "mesh": "Body", "group": "Hair_01",
+            "vertices": [0, 1, 2], "weight": "0.750000"
+        }]
+    });
+    let hash = seahawk::stroke::content_hash(&doc).expect("hashable");
+    doc["sha256"] = json!(hash);
+    doc
+}
+
 fn valid_pose() -> Value {
     let mut pose = json!({
         "schema": "seahawk.pose/v2",
@@ -459,7 +488,7 @@ fn valid_pose() -> Value {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn blender_profile_lists_all_twenty_five_provider_tools() {
+fn blender_profile_lists_all_twenty_six_provider_tools() {
     let mock = mock_provider();
     let mut s = spawn(Scratch::new(mock.port));
     let mut expected: Vec<String> = CORE.iter().map(|n| n.to_string()).collect();
@@ -517,6 +546,37 @@ fn pose_apply_and_capture_round_trip() {
         structured(&response)["pose"]["id"],
         "mock-pose",
         "{response}"
+    );
+}
+
+#[test]
+fn rig_apply_round_trip() {
+    let mock = mock_provider();
+    let mut s = spawn(Scratch::new(mock.port));
+    let doc = valid_rigbuild();
+    let response = s.call("blender.rig_apply", json!({"rigbuild": doc.clone()}), false);
+    assert_eq!(structured(&response)["applied"], true, "{response}");
+    assert_eq!(structured(&response)["bones_created"], 1, "{response}");
+    let params = mock.params_of("rig_apply").expect("provider saw rig_apply");
+    assert_eq!(params["rigbuild"]["sha256"], doc["sha256"]);
+    assert_eq!(params["rigbuild"]["id"], "wire-rigbuild-1");
+}
+
+#[test]
+fn rig_apply_refuses_a_bad_hash_before_the_provider() {
+    let mock = mock_provider();
+    let mut s = spawn(Scratch::new(mock.port));
+    let mut doc = valid_rigbuild();
+    doc["sha256"] = json!("0000000000000000000000000000000000000000000000000000000000000000");
+    let response = s.call("blender.rig_apply", json!({"rigbuild": doc}), false);
+    let text = format!("{response}");
+    assert!(
+        text.contains("seahawk_blender_artifact_invalid"),
+        "{response}"
+    );
+    assert!(
+        mock.params_of("rig_apply").is_none(),
+        "provider must not be contacted"
     );
 }
 

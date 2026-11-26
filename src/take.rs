@@ -32,6 +32,22 @@ use crate::stroke::{EXCLUDED_KEYS, canonical_bytes, content_hash};
 pub const TAKE_SCHEMA: &str = "seahawk.take/v2";
 pub const POSE_SCHEMA: &str = "seahawk.pose/v2";
 pub const EXPORT_SCHEMA: &str = "seahawk.take-export/v2";
+pub const RIGBUILD_SCHEMA: &str = "seahawk.rigbuild/v1";
+pub const MAX_RIG_BONES: usize = 512;
+pub const MAX_RIG_CONSTRAINTS: usize = 512;
+pub const MAX_RIG_WEIGHT_GROUPS: usize = 256;
+pub const MAX_RIG_VERTICES: usize = 200_000;
+pub const RIG_CONSTRAINT_TYPES: [&str; 9] = [
+    "IK",
+    "COPY_LOCATION",
+    "COPY_ROTATION",
+    "COPY_SCALE",
+    "DAMPED_TRACK",
+    "TRACK_TO",
+    "LIMIT_LOCATION",
+    "LIMIT_ROTATION",
+    "LIMIT_SCALE",
+];
 
 /// Hard bounds (DESIGN-ANIM §1.5): an artifact outside them
 /// is refused, never truncated. Sized from the real rigs: the
@@ -1198,6 +1214,277 @@ pub fn action_digest(envelope: &Value) -> Result<String, String> {
         bytes.push(b'\n');
     }
     Ok(hex(&Sha256::digest(&bytes)))
+}
+
+/// What validation learned about a rigbuild.
+#[derive(Clone, Debug)]
+pub struct RigbuildInfo {
+    pub id: String,
+    pub sha256: String,
+    pub bones: usize,
+    pub constraints: usize,
+    pub weight_groups: usize,
+    pub vertices: usize,
+}
+
+/// Validates one rigbuild envelope end to end: a declarative
+/// rig-construction document (bones, pose-bone constraints,
+/// vertex-group weights — all as data) bound to one scene by
+/// hash. Existence of the named armature, bones, and objects
+/// is the provider's check; the broker checks the document.
+pub fn validate_rigbuild(envelope: &Value) -> Result<RigbuildInfo, String> {
+    let Some(object) = envelope.as_object() else {
+        return Err(refuse("rigbuild must be a JSON object".to_string()));
+    };
+    if let Some(excluded) = find_excluded(envelope, false) {
+        return Err(refuse(format!(
+            "rigbuild carries excluded construct {excluded:?} (DESIGN-ANIM §3)"
+        )));
+    }
+    check_keys(
+        object,
+        &[
+            "schema",
+            "id",
+            "created_by",
+            "target",
+            "bones",
+            "constraints",
+            "weights",
+            "sha256",
+        ],
+        "rigbuild",
+    )?;
+    if object.get("schema").and_then(Value::as_str) != Some(RIGBUILD_SCHEMA) {
+        return Err(refuse(format!(
+            "rigbuild.schema must be {RIGBUILD_SCHEMA:?}"
+        )));
+    }
+    let id = required_id(object, "rigbuild")?;
+    check_created_by(object, "rigbuild")?;
+    let Some(target) = object.get("target").and_then(Value::as_object) else {
+        return Err(refuse("rigbuild.target must be an object".to_string()));
+    };
+    check_keys(target, &["scene_sha256", "armature"], "rigbuild.target")?;
+    let scene = target
+        .get("scene_sha256")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !is_sha256_hex(scene) {
+        return Err(refuse(
+            "rigbuild.target.scene_sha256 must be 64 lowercase hex characters \
+             (the scene-hash binding, DESIGN-ANIM §1.1)"
+                .to_string(),
+        ));
+    }
+    required_string(target, "armature", "rigbuild.target")?;
+    let bones = object
+        .get("bones")
+        .and_then(Value::as_array)
+        .ok_or_else(|| refuse("rigbuild.bones must be an array".to_string()))?;
+    if bones.len() > MAX_RIG_BONES {
+        return Err(refuse(format!(
+            "rigbuild carries {} bones; the bound is {MAX_RIG_BONES} (refused, not truncated)",
+            bones.len()
+        )));
+    }
+    let mut names: Vec<&str> = Vec::new();
+    for (index, bone) in bones.iter().enumerate() {
+        let what = format!("rigbuild.bones[{index}]");
+        let Some(bone) = bone.as_object() else {
+            return Err(refuse(format!("{what} must be an object")));
+        };
+        check_keys(
+            bone,
+            &["name", "parent", "head", "tail", "roll", "deform"],
+            &what,
+        )?;
+        let name = required_string(bone, "name", &what)?;
+        if names.contains(&name) {
+            return Err(refuse(format!("rigbuild carries bone {name:?} twice")));
+        }
+        names.push(name);
+        match bone.get("parent") {
+            Some(Value::Null) | None => {}
+            Some(Value::String(_)) => {}
+            _ => return Err(refuse(format!("{what}.parent must be a string or null"))),
+        }
+        for axis in ["head", "tail"] {
+            let vec = bone.get(axis).and_then(Value::as_array);
+            let ok = matches!(vec, Some(items) if items.len() == 3
+                && items.iter().all(|c| c.as_str().is_some_and(is_decimal6)));
+            if !ok {
+                return Err(refuse(format!(
+                    "{what}.{axis} must be three 6-decimal strings (D2)"
+                )));
+            }
+        }
+        if !bone
+            .get("roll")
+            .and_then(Value::as_str)
+            .is_some_and(is_decimal6)
+        {
+            return Err(refuse(format!(
+                "{what}.roll must be a 6-decimal string (D2)"
+            )));
+        }
+        if !bone.get("deform").is_some_and(Value::is_boolean) {
+            return Err(refuse(format!("{what}.deform must be a boolean")));
+        }
+    }
+    let constraints = object
+        .get("constraints")
+        .and_then(Value::as_array)
+        .ok_or_else(|| refuse("rigbuild.constraints must be an array".to_string()))?;
+    if constraints.len() > MAX_RIG_CONSTRAINTS {
+        return Err(refuse(format!(
+            "rigbuild carries {} constraints; the bound is {MAX_RIG_CONSTRAINTS}",
+            constraints.len()
+        )));
+    }
+    for (index, con) in constraints.iter().enumerate() {
+        let what = format!("rigbuild.constraints[{index}]");
+        let Some(con) = con.as_object() else {
+            return Err(refuse(format!("{what} must be an object")));
+        };
+        check_keys(
+            con,
+            &[
+                "bone",
+                "type",
+                "name",
+                "target",
+                "subtarget",
+                "chain_count",
+                "influence",
+            ],
+            &what,
+        )?;
+        required_string(con, "bone", &what)?;
+        if !con
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|t| RIG_CONSTRAINT_TYPES.contains(&t))
+        {
+            return Err(refuse(format!(
+                "{what}.type must be one of {RIG_CONSTRAINT_TYPES:?}"
+            )));
+        }
+        match con.get("name") {
+            Some(Value::Null) | None => {}
+            Some(Value::String(_)) => {}
+            _ => return Err(refuse(format!("{what}.name must be a string or null"))),
+        }
+        match con.get("target") {
+            Some(Value::Null) | None => {}
+            Some(Value::Object(tgt)) => {
+                check_keys(tgt, &["type", "name"], &format!("{what}.target"))?;
+                if tgt.get("type").and_then(Value::as_str) != Some("OBJECT") {
+                    return Err(refuse(format!(
+                        "{what}.target must name an object (type OBJECT)"
+                    )));
+                }
+                required_string(tgt, "name", &format!("{what}.target"))?;
+            }
+            _ => return Err(refuse(format!("{what}.target must be an object or null"))),
+        }
+        if !con.get("subtarget").is_some_and(Value::is_string) {
+            return Err(refuse(format!("{what}.subtarget must be a string")));
+        }
+        match con.get("chain_count") {
+            Some(Value::Null) | None => {}
+            Some(value) => {
+                let ok = value
+                    .as_i64()
+                    .is_some_and(|n| (0..=32).contains(&n) && value.is_i64());
+                if !ok {
+                    return Err(refuse(format!(
+                        "{what}.chain_count must be null or an integer in [0, 32]"
+                    )));
+                }
+            }
+        }
+        if !con
+            .get("influence")
+            .and_then(Value::as_str)
+            .is_some_and(is_decimal6)
+        {
+            return Err(refuse(format!(
+                "{what}.influence must be a 6-decimal string (D2)"
+            )));
+        }
+    }
+    let weights = object
+        .get("weights")
+        .and_then(Value::as_array)
+        .ok_or_else(|| refuse("rigbuild.weights must be an array".to_string()))?;
+    if weights.len() > MAX_RIG_WEIGHT_GROUPS {
+        return Err(refuse(format!(
+            "rigbuild carries {} weight groups; the bound is {MAX_RIG_WEIGHT_GROUPS}",
+            weights.len()
+        )));
+    }
+    let mut total_vertices: usize = 0;
+    for (index, group) in weights.iter().enumerate() {
+        let what = format!("rigbuild.weights[{index}]");
+        let Some(group) = group.as_object() else {
+            return Err(refuse(format!("{what} must be an object")));
+        };
+        check_keys(group, &["mesh", "group", "vertices", "weight"], &what)?;
+        required_string(group, "mesh", &what)?;
+        required_string(group, "group", &what)?;
+        let Some(vertices) = group.get("vertices").and_then(Value::as_array) else {
+            return Err(refuse(format!(
+                "{what}.vertices must be an array of non-negative integers"
+            )));
+        };
+        let mut seen: Vec<u64> = Vec::new();
+        for vertex in vertices {
+            let Some(v) = vertex.as_u64() else {
+                return Err(refuse(format!(
+                    "{what}.vertices must be an array of non-negative integers"
+                )));
+            };
+            if seen.contains(&v) {
+                return Err(refuse(format!("{what}.vertices carries a vertex twice")));
+            }
+            seen.push(v);
+        }
+        total_vertices += vertices.len();
+        let weight = group
+            .get("weight")
+            .and_then(Value::as_str)
+            .and_then(decimal6);
+        match weight {
+            Some(w) if (0.0..=1.0).contains(&w) => {}
+            _ => {
+                return Err(refuse(format!(
+                    "{what}.weight must be a 6-decimal string in [0, 1] (D2)"
+                )));
+            }
+        }
+    }
+    if total_vertices > MAX_RIG_VERTICES {
+        return Err(refuse(format!(
+            "rigbuild weights {total_vertices} vertices in total; the bound is {MAX_RIG_VERTICES}"
+        )));
+    }
+    if bones.is_empty() && constraints.is_empty() && weights.is_empty() {
+        return Err(refuse(
+            "rigbuild carries no bones, constraints, or weights; an empty build is refused"
+                .to_string(),
+        ));
+    }
+    let sha256 = check_sha256_field(object, "rigbuild")?;
+    check_content_hash(envelope, &sha256, "rigbuild")?;
+    Ok(RigbuildInfo {
+        id,
+        sha256,
+        bones: bones.len(),
+        constraints: constraints.len(),
+        weight_groups: weights.len(),
+        vertices: total_vertices,
+    })
 }
 
 #[cfg(test)]

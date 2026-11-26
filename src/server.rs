@@ -666,6 +666,7 @@ impl SeahawkServer {
         let artifact_prop = json!({"type": "object", "description": "seahawk.stroke/v1 artifact (DESIGN §2): canonical-JSON envelope, embedded SHA-256. Validated broker-side before downstream contact; invalid refuses seahawk_blender_artifact_invalid."});
         let params_prop = json!({"type": "object", "description": "Shell parameters (DESIGN §2): width_root, width_tip, thickness (metres, decimal strings), segments_per_point (int), atlas_tile {atlas_image, uv_rect [u0, v0, u1, v1]}, chain (vertex-group name), mirror_of (optional shell object)."});
         let take_prop = json!({"type": "object", "description": "seahawk.take/v2 artifact (DESIGN-ANIM §1): canonical-JSON envelope, embedded SHA-256, bound to one scene by hash. Validated broker-side before downstream contact; invalid refuses seahawk_blender_artifact_invalid."});
+        let rigbuild_prop = json!({"type": "object", "description": "seahawk.rigbuild/v1 artifact: declarative rig construction (bones, pose-bone constraints, vertex-group weights) as data, embedded SHA-256, bound to one scene by hash. Validated broker-side before downstream contact."});
         let pose_prop = json!({"type": "object", "description": "seahawk.pose/v2 artifact (DESIGN-ANIM §1.4): single-frame channel-value slice, embedded SHA-256. Validated broker-side before downstream contact."});
         let artifacts_prop = json!({"type": "object", "description": "GP stroke artifacts keyed by content hash, supplying the take's GP track references (DESIGN-ANIM §1.3); each validated broker-side, must hash to its key."});
         let path_prop = |what: &str| json!({"type": "string", "description": what});
@@ -804,6 +805,11 @@ impl SeahawkServer {
                 "blender.pose_apply",
                 "Write a pose artifact's values into the live scene as keys at the pose's frame (scene-hash binding checked before mutation). Write-class (in-memory).",
                 schema(vec![("pose", pose_prop.clone())], &["pose"]),
+            ),
+            (
+                "blender.rig_apply",
+                "Build rig structure from a rigbuild artifact: create bones (hierarchy as data), pose-bone constraints, and vertex-group weights on the armature of the bound scene (scene-hash binding checked before mutation; creates, never overwrites existing bones). Write-class (in-memory).",
+                schema(vec![("rigbuild", rigbuild_prop.clone())], &["rigbuild"]),
             ),
             (
                 "blender.curve_capture",
@@ -1264,6 +1270,25 @@ impl SeahawkServer {
                             None,
                         ));
                     }
+                }
+            }
+        }
+        if canonical == "blender.rig_apply" {
+            match args.get("rigbuild").filter(|r| r.is_object()) {
+                Some(doc) => {
+                    if let Err(message) = crate::take::validate_rigbuild(doc) {
+                        return Ok(refuse(
+                            codes::BLENDER_ARTIFACT_INVALID,
+                            &message,
+                            Some(class),
+                        ));
+                    }
+                }
+                None => {
+                    return Err(McpError::invalid_params(
+                        "blender.rig_apply requires a \"rigbuild\" object argument".to_string(),
+                        None,
+                    ));
                 }
             }
         }
@@ -5037,6 +5062,7 @@ mod tests {
             ("blender.curve_apply", Some(Pack::Blender)),
             ("blender.take_capture", Some(Pack::Blender)),
             ("blender.take_apply", Some(Pack::Blender)),
+            ("blender.rig_apply", Some(Pack::Blender)),
             ("blender.take_validate", Some(Pack::Blender)),
             ("blender.gp_capture_range", Some(Pack::Blender)),
             ("blender.gp_replay_range", Some(Pack::Blender)),

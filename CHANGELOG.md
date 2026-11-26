@@ -1,5 +1,17 @@
 # Changelog — seahawk
 
+## 1.3.0 — 2026-11-25 (rig construction)
+
+- **blender.rig_apply (op 26, write-class)**: rig construction
+  as data. A seahawk.rigbuild/v1 artifact — bones (name,
+  parent, head, tail, roll, deform), pose-bone constraints
+  (IK and eight further types), and vertex-group weight
+  assignments — validated broker-side (bounds, exclusion set,
+  content hash) and provider-side (scene-hash binding before
+  mutation; creates bones, never overwrites). Blender surface
+  is now twenty-six ops: nine read / nine write / eight
+  execute, none actuate. Provider 1.2.0.
+
 ## 1.0.0 — landed 2026-11-03 (D-657)
 
 The 1.0.0 line below is now seahawk's line of record on

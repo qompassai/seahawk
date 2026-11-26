@@ -36,7 +36,7 @@ const CORE: [&str; 4] = [
     "target.list",
 ];
 
-const BLENDER_TOOLS: [&str; 25] = [
+const BLENDER_TOOLS: [&str; 26] = [
     "blender.artifact_validate",
     "blender.blend_save",
     "blender.contact_sheet",
@@ -51,6 +51,7 @@ const BLENDER_TOOLS: [&str; 25] = [
     "blender.pose_apply",
     "blender.pose_capture",
     "blender.proof_render",
+    "blender.rig_apply",
     "blender.scene_census",
     "blender.scene_open",
     "blender.session_status",
@@ -442,7 +443,7 @@ fn paint_artifact() -> Value {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn blender_profile_lists_the_twenty_five_provider_tools() {
+fn blender_profile_lists_the_twenty_six_provider_tools() {
     let mock = mock_provider();
     let mut s = spawn(Scratch::new(Some(mock.port), ""));
     let mut expected: Vec<String> = CORE.iter().map(|n| n.to_string()).collect();
