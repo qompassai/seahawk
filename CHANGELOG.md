@@ -1,5 +1,9 @@
 # Changelog — seahawk
 
+## 1.3.1 - 2026-11-26
+
+- Patch: no functional changes. The 1.3.0 crates.io publish carried its README as metadata text "README.md" instead of the README contents, so the MCP Registry ownership check could not find the `mcp-name: ai.qompass/seahawk` marker that the packaged README already contained; 1.3.1 is published with the full README as the crates.io readme so the Registry record can validate.
+
 ## 1.3.0 — 2026-11-25 (rig construction)
 
 - **blender.rig_apply (op 26, write-class)**: rig construction
